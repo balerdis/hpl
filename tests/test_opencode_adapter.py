@@ -1,0 +1,2601 @@
+"""The OpenCode adapter: the only place OpenCode's own names are allowed."""
+from __future__ import annotations
+
+import json
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import textwrap
+import unittest
+import zipfile
+from dataclasses import replace
+from pathlib import Path, PurePath, PurePosixPath
+
+from hpl import cli
+from hpl.adapters.opencode import Adapter
+from hpl.adapters.opencode import adapter as adapter_module
+from hpl.adapters.opencode import render as render_module
+from hpl.core import content as content_module
+from hpl.core.content import (
+    Agent,
+    AgentMode,
+    Asset,
+    Command,
+    Distribution,
+    Execution,
+    Mcp,
+    RunsAs,
+    Skill,
+    SystemPrompt,
+)
+from hpl.core import registry as registry_module
+from hpl.core.registry import Registry
+from hpl.core.types import Capability, ConfigKeyArtifact, Environment, FileArtifact, Layout, ModelAssignment
+
+HOME = Path("/home/probe")
+ENVIRONMENT = Environment(home=HOME, data_dir=HOME / ".local" / "share" / "hpl")
+CONFIG = HOME / ".config" / "opencode"
+ORCHESTRATOR = "hpl-orchestrator"
+#: A real `Identity`, standing in for `Runtime.identity`: `own_artifacts`
+#: requires one now, and every direct call in this file passes the same real
+#: value `cli.py`'s composition root would.
+IDENTITY = cli.default_identity()
+
+
+def only(artifacts, kind):
+    return [item for item in artifacts if isinstance(item, kind)]
+
+
+#: The `apply_patch` scoping plugin builds its note out of an array of string
+#: fragments joined with no separator, so not one of its sentences exists as a
+#: literal anywhere in the source: a sentence ends mid-line and the next one
+#: starts after a quote, a comma and a newline. Asserting on the source text
+#: would therefore be asserting on the fragments rather than on what the model
+#: is actually handed, which is the proxy this project keeps getting bitten by.
+#: `scope_note_of` rebuilds the string the hook appends, and
+#: `ApplyPatchScopeHookTest` proves that reconstruction is the real thing by
+#: running the real hook under `node` and comparing.
+SCOPE_MARKER_CONST = re.compile(r'const SCOPE_MARKER = "([^"]*)"')
+IMPERATIVE_ANCHOR_CONST = re.compile(r'const IMPERATIVE_ANCHOR = "([^"]*)"')
+SCOPE_NOTE_ARRAY = re.compile(r"const SCOPE_NOTE = \[(.*?)\n\]\.join\(\"\"\)", re.DOTALL)
+SCOPE_NOTE_FRAGMENT = re.compile(r'"((?:[^"\\]|\\.)*)"\s*,|`((?:[^`\\]|\\.)*)`\s*,')
+
+#: A fragment's escapes have to be resolved, or the note's own paragraph break
+#: would come back as the two characters `\` and `n` and every reader of the
+#: reconstruction would be looking at something the model never sees.
+JS_ESCAPE = re.compile(r"\\(.)", re.DOTALL)
+JS_ESCAPED = {"n": "\n", "r": "\r", "t": "\t", "0": "\0"}
+
+
+def unescaped(fragment: str) -> str:
+    """A JavaScript string fragment as the joined constant actually reads."""
+    return JS_ESCAPE.sub(lambda match: JS_ESCAPED.get(match.group(1), match.group(1)), fragment)
+
+
+def scope_note_of(source: str) -> str:
+    """The exact text the scoping plugin appends to `apply_patch`'s description."""
+    array = SCOPE_NOTE_ARRAY.search(source)
+    marker = SCOPE_MARKER_CONST.search(source)
+    if array is None or marker is None:
+        return ""
+    fragments = [
+        unescaped(plain if backtick is None else backtick)
+        for plain, backtick in (
+            (match.group(1), match.group(2))
+            for match in SCOPE_NOTE_FRAGMENT.finditer(array.group(1))
+        )
+    ]
+    return "".join(fragments).replace("${SCOPE_MARKER}", marker.group(1))
+
+
+#: What the note has always said, and still has to: the tool is local, that is a
+#: statement about reach and not a ban on the shell, and for a remote destination
+#: the shell is the only road.
+NOTE_IS_LOCAL_ONLY = re.compile(r"\bScope of this tool\b[^.]*\bnowhere else\b", re.IGNORECASE)
+NOTE_NOT_A_BAN_ON_THE_SHELL = re.compile(
+    r"\bnot an instruction to avoid the shell\b", re.IGNORECASE
+)
+NOTE_REMOTE_IS_THE_ONLY_WAY = re.compile(
+    r"\bon another machine the shell is not a way around this tool\b[^.]*\bonly way there\b",
+    re.IGNORECASE,
+)
+
+#: What Piece 2 adds: the tool writes as one particular user, so a file owned by
+#: somebody else is out of reach for the same reason a remote file is -- and that
+#: is a limit on the tool, not a prohibition on the change.
+NOTE_WRITES_AS_THE_SESSION_USER = re.compile(
+    r"\bScope of this tool\b[^.]*\bas the user (?:this|that) session runs as\b", re.IGNORECASE
+)
+NOTE_CANNOT_WRITE_ANOTHER_USERS_FILE = re.compile(
+    r"\bcannot reach a file that lives on another host\b[^.]*"
+    r"\bcannot write a file owned by another user\b",
+    re.IGNORECASE,
+)
+NOTE_SUDO_IS_NOT_FORBIDDEN = re.compile(
+    r"\bdoes not forbid\b[^.]*`sudo`[^.]*\bwhen the person has authorized that change\b",
+    re.IGNORECASE,
+)
+NOTE_SAME_REASON_AS_REMOTE = re.compile(
+    r"\bonly way there\b[^.]*\bfile this user cannot write\b[^.]*"
+    r"\bthe way there for the same reason\b",
+    re.IGNORECASE,
+)
+NOTE_IS_A_LIMIT_NOT_A_PROHIBITION = re.compile(
+    r"\bpermission error this tool returns\b[^.]*"
+    r"\bis a limit on this tool, not a prohibition\b",
+    re.IGNORECASE,
+)
+
+
+class LayoutTest(unittest.TestCase):
+    def setUp(self):
+        self.layout = Adapter().layout(ENVIRONMENT)
+
+    def test_resolves_the_standard_configuration_root(self):
+        self.assertEqual(self.layout.config_dir, CONFIG)
+
+    def test_honours_an_absolute_xdg_config_home(self):
+        environment = Environment(home=HOME, variables={"XDG_CONFIG_HOME": "/opt/cfg"})
+        self.assertEqual(Adapter().layout(environment).config_dir, Path("/opt/cfg/opencode"))
+
+    def test_ignores_a_relative_xdg_config_home(self):
+        environment = Environment(home=HOME, variables={"XDG_CONFIG_HOME": "relative/cfg"})
+        self.assertEqual(Adapter().layout(environment).config_dir, CONFIG)
+
+    def test_every_file_based_capability_has_its_path(self):
+        """Settings-based capabilities need no directory; the registry defines which."""
+        for capability in Adapter().capabilities().enabled & registry_module._NEEDS_ANCHOR:
+            self.assertIsNotNone(self.layout.anchor(capability), capability.value)
+
+    def test_sub_agents_need_no_directory(self):
+        """OpenCode declares its subagents inside opencode.json, not as files."""
+        self.assertIsNone(self.layout.agents_dir)
+
+    def test_the_system_prompt_is_not_the_users_own_agents_file(self):
+        self.assertEqual(self.layout.system_prompt_file, CONFIG / "hpl-AGENTS.md")
+        self.assertNotEqual(self.layout.system_prompt_file, CONFIG / "AGENTS.md")
+
+    def test_building_a_layout_touches_no_filesystem(self):
+        Adapter().layout(Environment(home=Path("/nonexistent/probe")))
+
+
+class RegistrationTest(unittest.TestCase):
+    def test_the_adapter_satisfies_the_registry(self):
+        registry = Registry()
+        registry.register(Adapter())
+        self.assertEqual(registry.ids(), ("opencode",))
+
+    def test_declares_only_what_it_implements(self):
+        manifest = Adapter().capabilities()
+        self.assertEqual(
+            sorted(item.value for item in manifest.enabled),
+            [
+                "mcp",
+                "per_agent_model",
+                "prompts",
+                "skills",
+                "slash_commands",
+                "sub_agents",
+                "system_prompt",
+            ],
+        )
+
+    def test_mcp_is_declared_now_that_its_content_exists(self):
+        self.assertTrue(Adapter().capabilities().mcp)
+        self.assertTrue(callable(getattr(Adapter(), "render_mcp", None)))
+
+    def test_per_agent_model_is_declared_now_that_model_catalog_is_implemented(self):
+        self.assertTrue(Adapter().capabilities().per_agent_model)
+        self.assertTrue(callable(getattr(Adapter(), "model_catalog", None)))
+
+
+class DetectionTest(unittest.TestCase):
+    def test_reports_a_configuration_directory_that_does_not_exist(self):
+        detection = Adapter().detect(Environment(home=Path("/nonexistent/probe")))
+        self.assertFalse(detection.config_found)
+        self.assertEqual(detection.config_dir, Path("/nonexistent/probe/.config/opencode"))
+
+    def test_an_empty_path_finds_no_binary(self):
+        detection = Adapter().detect(Environment(home=HOME, variables={"PATH": ""}))
+        self.assertFalse(detection.installed)
+        self.assertIsNone(detection.binary_path)
+
+
+class ModelCatalogTest(unittest.TestCase):
+    """`model_catalog` reads three real files, but only ever ones this test made.
+
+    Every path below is rooted in a throwaway directory this test creates and
+    tears down itself, through XDG variables the adapter already honours
+    elsewhere. Nothing here ever names the real machine's home.
+    """
+
+    def setUp(self):
+        self.scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(self.scratch.cleanup)
+        root = Path(self.scratch.name)
+        self.environment = Environment(
+            home=root / "home",
+            variables={
+                "XDG_CACHE_HOME": str(root / "cache"),
+                "XDG_DATA_HOME": str(root / "data"),
+                "XDG_CONFIG_HOME": str(root / "config"),
+            },
+        )
+
+    def _write(self, relative: str, payload: object) -> None:
+        path = Path(self.scratch.name) / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+    def test_a_missing_catalog_file_is_an_empty_catalog_not_an_error(self):
+        catalog = Adapter().model_catalog(self.environment)
+        self.assertEqual(catalog.providers, ())
+
+    def test_a_credentialed_provider_offers_its_tool_capable_models(self):
+        self._write(
+            "cache/opencode/models.json",
+            {
+                "anthropic": {
+                    "models": {
+                        "claude-sonnet-5": {"tool_call": True},
+                        "no-tools": {"tool_call": False},
+                    }
+                }
+            },
+        )
+        self._write("data/opencode/auth.json", {"anthropic": {"type": "oauth", "access": "leak-me-not"}})
+        catalog = Adapter().model_catalog(self.environment)
+        self.assertEqual([p.id for p in catalog.providers], ["anthropic"])
+        self.assertEqual([m.id for m in catalog.providers[0].models], ["claude-sonnet-5"])
+
+    def test_a_provider_declared_in_the_users_own_config_is_offered(self):
+        self._write("cache/opencode/models.json", {"custom-llm": {"models": {"m": {"tool_call": True}}}})
+        self._write("config/opencode/opencode.json", {"provider": {"custom-llm": {}}})
+        catalog = Adapter().model_catalog(self.environment)
+        self.assertEqual([p.id for p in catalog.providers], ["custom-llm"])
+
+    def test_a_provider_with_no_session_no_env_and_no_declaration_is_absent(self):
+        self._write("cache/opencode/models.json", {"anthropic": {"models": {"m": {"tool_call": True}}}})
+        catalog = Adapter().model_catalog(self.environment)
+        self.assertEqual(catalog.providers, ())
+
+    def test_a_credential_value_never_appears_anywhere_in_the_result(self):
+        self._write(
+            "cache/opencode/models.json",
+            {"anthropic": {"models": {"claude-sonnet-5": {"tool_call": True}}}},
+        )
+        self._write(
+            "data/opencode/auth.json",
+            {"anthropic": {"type": "oauth", "access": "top-secret-oauth-token"}},
+        )
+        catalog = Adapter().model_catalog(self.environment)
+        self.assertNotIn("top-secret-oauth-token", repr(catalog))
+
+
+class SkillRenderTest(unittest.TestCase):
+    def setUp(self):
+        self.layout = Adapter().layout(ENVIRONMENT)
+        self.skill = Skill(
+            name="alpha",
+            description="d",
+            assets=(
+                Asset(PurePosixPath("SKILL.md"), b"skill body"),
+                Asset(PurePosixPath("references/guide.md"), b"guide"),
+            ),
+            source=PurePosixPath("skills/alpha/SKILL.md"),
+        )
+
+    def test_travels_verbatim(self):
+        artifacts = Adapter().render_skill(self.layout, self.skill)
+        self.assertEqual([item.content for item in artifacts], [b"skill body", b"guide"])
+
+    def test_lands_under_the_skill_directory(self):
+        artifacts = Adapter().render_skill(self.layout, self.skill)
+        self.assertEqual(
+            [item.path for item in artifacts],
+            [CONFIG / "skills/alpha/SKILL.md", CONFIG / "skills/alpha/references/guide.md"],
+        )
+
+
+class AgentRenderTest(unittest.TestCase):
+    def setUp(self):
+        self.adapter = Adapter()
+        self.layout = self.adapter.layout(ENVIRONMENT)
+
+    def agent(self, **overrides):
+        fields = dict(
+            name="sdd-verify",
+            description="Readiness authority",
+            body="# Verify\n\nProve it.\n",
+            mode=AgentMode.SUBAGENT,
+            source=PurePosixPath("agents/sdd-verify.md"),
+        )
+        fields.update(overrides)
+        return Agent(**fields)
+
+    def value(self, agent):
+        return only(self.adapter.render_agent(self.layout, agent, mcp=()), ConfigKeyArtifact)[0].value
+
+    def test_omitting_mcp_raises_type_error(self):
+        """`mcp` has no default -- even though this adapter ignores its
+        contents, a caller that forgets it must fail loudly with
+        `TypeError`, not silently render an agent (see `ports.cli_adapter.
+        CliAdapter.render_agent`'s own docstring for why)."""
+        with self.assertRaises(TypeError):
+            self.adapter.render_agent(self.layout, self.agent())
+
+    def test_writes_one_entry_under_the_agent_map(self):
+        artifact = only(self.adapter.render_agent(self.layout, self.agent(), mcp=()), ConfigKeyArtifact)[0]
+        self.assertEqual(artifact.pointer, "/agent/sdd-verify")
+        self.assertEqual(artifact.path, CONFIG / "opencode.json")
+
+    def test_references_the_prompt_file_instead_of_inlining_it(self):
+        self.assertEqual(self.value(self.agent())["prompt"], "{file:./prompts/sdd-verify.md}")
+
+    def test_hidden_is_written_for_a_subagent_and_for_nobody_else(self):
+        self.assertTrue(self.value(self.agent(mode=AgentMode.SUBAGENT))["hidden"])
+        self.assertNotIn("hidden", self.value(self.agent(mode=AgentMode.PRIMARY)))
+
+    def test_tools_are_translated_to_opencode_names(self):
+        agent = self.agent(requires_tools=("read", "bash"), optional_tools=("write",))
+        self.assertEqual(
+            self.value(agent)["tools"],
+            {"*": False, "read": True, "bash": True, "write": True},
+        )
+
+    def test_an_optional_mcp_id_is_granted_as_a_wildcard(self):
+        agent = self.agent(optional_mcp=("context7",))
+        self.assertEqual(self.value(agent)["tools"], {"*": False, "context7*": True})
+
+    def test_native_tools_and_mcp_wildcards_are_granted_together(self):
+        agent = self.agent(requires_tools=("read", "bash"), optional_mcp=("context7",))
+        self.assertEqual(
+            self.value(agent)["tools"],
+            {"*": False, "read": True, "bash": True, "context7*": True},
+        )
+
+    def test_a_denied_mcp_tool_is_turned_back_off_after_the_wildcard_grant(self):
+        agent = self.agent(
+            optional_mcp=("cbm",),
+            denied_mcp_tools=("cbm_delete_project", "cbm_ingest_traces"),
+        )
+        tools = self.value(agent)["tools"]
+        self.assertEqual(
+            tools,
+            {
+                "*": False,
+                "cbm*": True,
+                "cbm_delete_project": False,
+                "cbm_ingest_traces": False,
+            },
+        )
+        keys = list(tools)
+        self.assertLess(keys.index("cbm*"), keys.index("cbm_delete_project"))
+        self.assertLess(keys.index("cbm*"), keys.index("cbm_ingest_traces"))
+
+    def test_no_denies_rendered_when_nothing_is_withheld(self):
+        agent = self.agent(optional_mcp=("context7",))
+        tools = self.value(agent)["tools"]
+        self.assertEqual(tools, {"*": False, "context7*": True})
+
+    def test_a_granted_mcp_key_is_written_as_a_wildcard(self):
+        agent = self.agent(granted_mcp=("jira",))
+        self.assertEqual(self.value(agent)["tools"], {"*": False, "jira*": True})
+
+    def test_multiple_granted_mcp_keys_are_all_written(self):
+        agent = self.agent(granted_mcp=("jira", "figma"))
+        self.assertEqual(
+            self.value(agent)["tools"], {"*": False, "jira*": True, "figma*": True}
+        )
+
+    def test_a_granted_mcp_key_never_reopens_a_tool_denied_from_a_shipped_server(self):
+        """The ordering trap: the runtime keeps the *last* rule matching a
+        name. `denied_mcp_tools` narrows a shipped server's wildcard grant by
+        being written after it -- so a user grant must be written *before*
+        `denied_mcp_tools`, never after, or a wildcard the user administers
+        would re-open exactly the tool HPL deliberately denied.
+
+        Chosen so the trap actually fires: `denied_mcp_tools` here names
+        `jira_delete_issue`, fully qualified under the same key the user is
+        granted -- had `denied_mcp_tools` been written before the grant
+        instead of after, this assertion would fail.
+        """
+        agent = self.agent(granted_mcp=("jira",), denied_mcp_tools=("jira_delete_issue",))
+        tools = self.value(agent)["tools"]
+        self.assertEqual(tools["jira_delete_issue"], False)
+        keys = list(tools)
+        self.assertLess(keys.index("jira*"), keys.index("jira_delete_issue"))
+
+    def test_a_granted_mcp_key_is_written_after_the_optional_mcp_wildcard(self):
+        agent = self.agent(optional_mcp=("context7",), granted_mcp=("jira",))
+        keys = list(self.value(agent)["tools"])
+        self.assertLess(keys.index("context7*"), keys.index("jira*"))
+
+    def test_the_deny_baseline_is_written_before_anything_it_is_meant_to_lose_to(self):
+        """The order of these keys decides whether any agent has any tool.
+
+        The runtime turns this map into permission rules in the order it reads
+        them, and resolves a tool against the **last** rule that matches. So a
+        grant only beats the blanket deny by coming after it. Emit the deny
+        last and every agent silently loses every tool, while a comparison of
+        these two maps as dictionaries still passes: Python does not read
+        order into that equality, and the runtime reads nothing else.
+        """
+        agent = self.agent(requires_tools=("read",), optional_mcp=("context7",))
+        keys = list(self.value(agent)["tools"])
+        self.assertEqual(keys[0], "*", f"the deny baseline must come first, got {keys}")
+        self.assertGreater(len(keys), 1, "a baseline with nothing after it grants nothing")
+
+    def test_no_declared_tools_still_renders_the_deny_baseline(self):
+        """Declaring nothing must mean nothing, not the runtime's full default toolset."""
+        self.assertEqual(self.value(self.agent())["tools"], {"*": False})
+
+    def test_a_tool_with_no_opencode_name_is_refused(self):
+        with self.assertRaises(render_module.RenderError) as raised:
+            self.value(self.agent(requires_tools=("telepathy",)))
+        self.assertIn("telepathy", str(raised.exception))
+
+    def test_delegation_becomes_a_deny_by_default_permission_block(self):
+        agent = self.agent(may_delegate_to=("explore", "sdd-verify"))
+        self.assertEqual(
+            self.value(agent)["permission"],
+            {"*": "deny", "task": {"*": "deny", "explore": "allow", "sdd-verify": "allow"}},
+        )
+
+    def test_the_deny_baseline_is_emitted_even_with_no_declared_delegation(self):
+        """An agent that names nobody must still ship a permission.task block."""
+        self.assertEqual(self.value(self.agent())["permission"], {"*": "deny", "task": {"*": "deny"}})
+
+    def test_a_granted_native_tool_is_translated_into_permission_too(self):
+        agent = self.agent(requires_tools=("read", "bash"), mode=AgentMode.PRIMARY)
+        permission = self.value(agent)["permission"]
+        self.assertEqual(permission["read"]["*"], "allow")
+        self.assertEqual(permission["bash"], "allow")
+
+    def test_a_subagents_bash_allows_everything_and_asks_for_a_git_push(self):
+        """The git-push decision: a sub-agent's `git push` asks the person. The
+        `"*"` allow must come first, because the runtime keeps the last
+        matching rule (`permission/index.ts` `evaluate`)."""
+        permission = self.value(self.agent(requires_tools=("read", "bash"), mode=AgentMode.SUBAGENT))["permission"]
+        self.assertEqual(permission["bash"], render_module.SUBAGENT_BASH_PERMISSION)
+        self.assertEqual(permission["bash"]["git push *"], "ask")
+        self.assertEqual(permission["bash"]["git * push *"], "ask")
+        self.assertEqual(list(permission["bash"])[0], "*")
+        self.assertEqual(permission["read"]["*"], "allow")
+
+    def test_a_primary_agents_bash_stays_a_plain_allow(self):
+        permission = self.value(self.agent(requires_tools=("bash",), mode=AgentMode.PRIMARY))["permission"]
+        self.assertEqual(permission["bash"], "allow")
+
+    def test_a_subagent_without_bash_gets_no_bash_key(self):
+        permission = self.value(self.agent(requires_tools=("read",), mode=AgentMode.SUBAGENT))["permission"]
+        self.assertNotIn("bash", permission)
+
+    def test_only_bash_changes_between_a_subagent_and_a_primary_with_the_same_tools(self):
+        kwargs = dict(requires_tools=("read", "bash", "write"), optional_mcp=("context7",))
+        sub = self.value(self.agent(mode=AgentMode.SUBAGENT, **kwargs))["permission"]
+        primary = self.value(self.agent(mode=AgentMode.PRIMARY, **kwargs))["permission"]
+        self.assertNotEqual(sub["bash"], primary["bash"])
+        differing = {k for k in sub if sub[k] != primary[k]}
+        self.assertEqual(differing, {"bash", "read", "edit"})
+        self.assertEqual({k: v for k, v in sub.items() if k not in differing}, {k: v for k, v in primary.items() if k not in differing})
+
+    def test_shipped_subagents_ask_for_a_git_push_and_shipped_primaries_do_not(self):
+        loaded = content_module.load()
+        seen = set()
+        for item in loaded.agents:
+            value = only(render_module.agent(self.layout, item), ConfigKeyArtifact)[0].value
+            bash = value["permission"].get("bash")
+            if bash is None:
+                continue
+            seen.add(item.mode)
+            expected = render_module.SUBAGENT_BASH_PERMISSION if item.mode is AgentMode.SUBAGENT else "allow"
+            self.assertEqual(bash, expected, item.name)
+        self.assertEqual(seen, {AgentMode.SUBAGENT, AgentMode.PRIMARY})
+
+    # --- The sensitive-file floor and the widened push guard ---
+
+    FLOOR_HITS = (
+        ".env",
+        "app/.env",
+        "../../home/probe/.env.local",
+        ".env.example",
+        ".ssh/id_rsa",
+        "../../home/probe/.ssh/id_rsa",
+        "svc/secrets/token.txt",
+        "secrets/token.txt",
+        ".credentials/store",
+        ".aws/credentials",
+        "../../home/probe/.aws/credentials",
+        ".config/gh/hosts.yml",
+        "../../home/probe/.config/gh/hosts.yml",
+        "certs/server.pem",
+        "server.pem",
+        "deploy.key",
+        "a/b/deploy.key",
+    )
+    FLOOR_MISSES = ("src/app.py", "README.md", "envfile", "my.environment", "secretsauce/x", ".aws/config", "keys.txt")
+
+    @staticmethod
+    def resolve(rules, text):
+        """The runtime's own resolution: last matching rule wins, and a
+        trailing ` *` also matches the bare command (`wildcard.ts`), which
+        `_wildcard_match` deliberately does not reproduce."""
+
+        def matches(pattern):
+            if render_module._wildcard_match(text, pattern):
+                return True
+            return pattern.endswith(" *") and render_module._wildcard_match(text, pattern[:-2])
+
+        hit = [action for pattern, action in rules.items() if matches(pattern)]
+        return hit[-1]
+
+    def test_a_primary_asks_for_every_sensitive_path_on_read_and_edit(self):
+        permission = self.value(self.agent(requires_tools=("read", "write"), mode=AgentMode.PRIMARY))["permission"]
+        for key in ("read", "edit"):
+            self.assertEqual(list(permission[key])[0], "*")
+            for text in self.FLOOR_HITS:
+                self.assertEqual(self.resolve(permission[key], text), "ask", (key, text))
+            for text in self.FLOOR_MISSES:
+                self.assertEqual(self.resolve(permission[key], text), "allow", (key, text))
+
+    def test_a_subagent_is_denied_never_asked_for_a_sensitive_path(self):
+        """An `ask` at delegation depth two or more hangs (#39112)."""
+        permission = self.value(self.agent(requires_tools=("read", "edit"), mode=AgentMode.SUBAGENT))["permission"]
+        for key in ("read", "edit"):
+            self.assertNotIn("ask", permission[key].values())
+            for text in self.FLOOR_HITS:
+                self.assertEqual(self.resolve(permission[key], text), "deny", (key, text))
+
+    def test_the_floor_has_no_env_example_exemption(self):
+        """The runtime's own default allows `*.env.example`; the floor is
+        written after it and must win, with no exemption."""
+        self.assertIn(".env.*", render_module.SENSITIVE_FILE_PATTERNS)
+        self.assertEqual(self.resolve(render_module.sensitive_file_permission(AgentMode.PRIMARY), ".env.example"), "ask")
+
+    def test_the_floor_is_never_weaker_than_the_runtimes_own_env_default(self):
+        """The runtime's default asks for `*.env` and `*.env.*`
+        (`agent/agent.ts:130-135`); the agent block is appended after it, so
+        the floor must cover them too. `*.env.*` also catches `app.env.ts`,
+        exactly as the default does: an accepted over-match, pinned here."""
+        for mode, expected in ((AgentMode.PRIMARY, "ask"), (AgentMode.SUBAGENT, "deny")):
+            rules = render_module.sensitive_file_permission(mode)
+            for text in ("prod.env", "config/dev.env", "prod.env.local", "config/prod.env.local", "app.env.ts"):
+                self.assertEqual(self.resolve(rules, text), expected, (mode, text))
+
+    def test_env_templates_get_no_exemption_for_primary_or_subagent(self):
+        """Recorded decision: the rule lists `.env.*` without exceptions."""
+        for text in (".env.example", ".env.sample", ".env.template", "app/.env.example"):
+            primary = render_module.sensitive_file_permission(AgentMode.PRIMARY)
+            subagent = render_module.sensitive_file_permission(AgentMode.SUBAGENT)
+            self.assertEqual(self.resolve(primary, text), "ask", text)
+            self.assertEqual(self.resolve(subagent, text), "deny", text)
+
+    def test_the_env_prefix_pattern_over_matches_an_equals_sign_before_the_command_text(self):
+        """Documented false positive: `*=*` matches any `=` before the command
+        text, and fires only when ` git push` appears later in the line."""
+        rules = render_module.SUBAGENT_BASH_PERMISSION
+        self.assertEqual(self.resolve(rules, "X=1 git log push"), "ask")
+        self.assertEqual(self.resolve(rules, "X=1 git log"), "allow")
+
+    def test_no_sensitive_pattern_is_absolute_or_home_relative(self):
+        """The runtime passes worktree-relative paths, so such a pattern never matches."""
+        for pattern in render_module.SENSITIVE_FILE_PATTERNS:
+            self.assertFalse(pattern.startswith(("/", "~", "$HOME")), pattern)
+
+    def test_an_agent_without_read_or_edit_gets_no_floor_keys(self):
+        permission = self.value(self.agent(requires_tools=("grep",)))["permission"]
+        self.assertNotIn("read", permission)
+        self.assertNotIn("edit", permission)
+
+    def test_the_push_guard_also_asks_behind_an_env_prefix_or_an_absolute_binary(self):
+        rules = render_module.SUBAGENT_BASH_PERMISSION
+        for text in (
+            "git push",
+            "git push origin main",
+            "FOO=1 git push origin main",
+            "A=1 B=2 git -C . push",
+            "/usr/bin/git push origin main",
+            "FOO=1 /usr/bin/git push",
+            "gh pr create --title x",
+            "gh pr merge 12",
+            "gh issue create",
+            "gh release create v1",
+            "gh repo create x",
+            "/usr/bin/gh pr create",
+            "FOO=1 gh pr merge 3",
+        ):
+            self.assertEqual(self.resolve(rules, text), "ask", text)
+
+    def test_the_push_guard_stays_quiet_on_ordinary_read_only_commands(self):
+        rules = render_module.SUBAGENT_BASH_PERMISSION
+        for text in (
+            "gh pr view 12",
+            "gh pr list",
+            "gh pr status",
+            "gh release list",
+            "gh issue view 3",
+            "git log --oneline",
+            "git status",
+            "git diff HEAD~1",
+            "ls -la",
+            "FOO=1 make test",
+            "/usr/bin/git status",
+        ):
+            self.assertEqual(self.resolve(rules, text), "allow", text)
+
+    def test_write_targets_the_runtimes_own_edit_permission_not_a_write_key(self):
+        """The runtime's `permission` schema has no `write` key: its loader folds
+        `write`, `edit` and `patch` onto the single `edit` permission it does
+        have. A literal rename of a granted `write` into `permission["write"]`
+        would govern nothing, and this agent would silently lose the ability
+        to write -- so `write` has to land on `edit` here, same as `edit` does.
+        """
+        agent = self.agent(requires_tools=("write",))
+        permission = self.value(agent)["permission"]
+        self.assertEqual(permission["edit"]["*"], "allow")
+        self.assertNotIn("write", permission)
+
+    def test_edit_also_targets_the_edit_permission(self):
+        agent = self.agent(requires_tools=("edit",))
+        self.assertEqual(self.value(agent)["permission"]["edit"]["*"], "allow")
+
+    def test_declaring_both_write_and_edit_still_yields_one_edit_key(self):
+        agent = self.agent(requires_tools=("write", "edit"))
+        permission = self.value(agent)["permission"]
+        self.assertEqual(permission["edit"]["*"], "allow")
+        self.assertNotIn("write", permission)
+
+    def test_an_optional_mcp_id_is_granted_as_a_wildcard_in_permission_too(self):
+        agent = self.agent(optional_mcp=("context7",))
+        self.assertEqual(self.value(agent)["permission"]["context7*"], "allow")
+
+    def test_a_denied_mcp_tool_is_written_after_the_wildcard_and_before_task(self):
+        agent = self.agent(
+            optional_mcp=("cbm",),
+            denied_mcp_tools=("cbm_delete_project", "cbm_ingest_traces"),
+        )
+        permission = self.value(agent)["permission"]
+        self.assertEqual(permission["cbm_delete_project"], "deny")
+        self.assertEqual(permission["cbm_ingest_traces"], "deny")
+        keys = list(permission)
+        self.assertLess(keys.index("cbm*"), keys.index("cbm_delete_project"))
+        self.assertLess(keys.index("cbm_delete_project"), keys.index("task"))
+
+    def test_a_granted_mcp_key_is_allowed_as_a_wildcard_in_permission_too(self):
+        agent = self.agent(granted_mcp=("jira",))
+        self.assertEqual(self.value(agent)["permission"]["jira*"], "allow")
+
+    def test_a_granted_mcp_key_never_reopens_a_denied_tool_in_permission(self):
+        """The same ordering trap as `tools`, in `permission`: the deny for a
+        shipped server's withheld tool must still win over a user grant's
+        wildcard, because `permission` is the map the runtime actually
+        resolves calls against.
+        """
+        agent = self.agent(granted_mcp=("jira",), denied_mcp_tools=("jira_delete_issue",))
+        permission = self.value(agent)["permission"]
+        self.assertEqual(permission["jira_delete_issue"], "deny")
+        keys = list(permission)
+        self.assertLess(keys.index("jira*"), keys.index("jira_delete_issue"))
+        self.assertLess(keys.index("jira_delete_issue"), keys.index("task"))
+
+    def test_no_permission_denies_rendered_when_nothing_is_withheld(self):
+        agent = self.agent(optional_mcp=("context7",))
+        permission = self.value(agent)["permission"]
+        self.assertEqual(
+            permission,
+            {"*": "deny", "context7*": "allow", "task": {"*": "deny"}},
+        )
+
+    def test_permission_merges_native_tools_mcp_and_delegation_together(self):
+        agent = self.agent(
+            requires_tools=("read", "write"),
+            optional_mcp=("context7",),
+            may_delegate_to=("explore",),
+        )
+        self.assertEqual(
+            self.value(agent)["permission"],
+            {
+                "*": "deny",
+                "read": render_module.sensitive_file_permission(AgentMode.SUBAGENT),
+                "edit": render_module.sensitive_file_permission(AgentMode.SUBAGENT),
+                "context7*": "allow",
+                "external_directory": {
+                    "*": "allow",
+                    f"{CONFIG.as_posix()}/skills/*": "allow",
+                    **render_module.EXTERNAL_DIRECTORY_DENY_FLOOR,
+                },
+                "task": {"*": "deny", "explore": "allow"},
+            },
+        )
+
+    def test_a_reader_is_allowed_out_to_the_config_directory_and_nowhere_else(self):
+        """Reading a path outside the project worktree is a permission of its own.
+
+        `read`, `grep`, `glob`, `edit`, `write` and `bash` each call the
+        runtime's own `assertExternalDirectory` before they ask for their
+        named permission, and that asks under the separate name
+        `external_directory`. Permission names are matched by wildcard and
+        resolved to the last match, so the baseline this map opens with
+        matches that name too. Every path HPL itself hands an agent (a
+        phase agent's own SKILL.md, the `_shared` conventions) lives under the
+        config directory and outside every worktree, so without this grant the
+        whole lazy-loading contract is unreadable by construction. The grant is
+        a pattern rather than a bare `allow` so that it opens exactly the
+        directory HPL writes into, and nothing else on the machine.
+        """
+        agent = self.agent(requires_tools=("read",))
+        rule = self.value(agent)["permission"]["external_directory"]
+        self.assertEqual(
+            rule,
+            {
+                "*": "allow",
+                f"{CONFIG.as_posix()}/skills/*": "allow",
+                **render_module.EXTERNAL_DIRECTORY_DENY_FLOOR,
+            },
+        )
+
+    def test_a_subagents_external_directory_baseline_is_allow_not_ask(self):
+        """Reported from real use: a sub-agent (`sdd-verify`) pointed a `bash`
+        working directory outside its worktree and was refused outright, with
+        no prompt, even though its own `bash` permission was `allow`.
+
+        The baseline used to split by `item.mode` -- `"deny"` for a
+        sub-agent, `"ask"` for a primary -- on the reasoning that a sub-agent
+        has nobody to prompt, so a clean refusal beats a hang. That reasoning
+        does not hold: the runtime's own `ask()` returns a `DeniedError` the
+        instant it sees a configured `"deny"`, before it would ever publish a
+        prompt, and an approval only ever concatenates onto the *end* of the
+        same rule list -- so for a directory only one sub-agent's session
+        ever touches, no earlier approval exists to out-rank that `"deny"`,
+        and the refusal becomes permanent for the life of the runtime, not a
+        one-time no. `"ask"` for every agent, sub-agent included, is what
+        keeps the door open for a person to approve it instead. That baseline
+        has since moved a second time, from `"ask"` to `"allow"`, as a
+        deliberate product decision surfaced by upstream issue #39112: a
+        depth-two sub-agent's `"ask"` never renders in any TUI view and
+        hangs forever, which is worse than either alternative this entry has
+        ever held. See `_permission`'s own docstring for the full account.
+        """
+        agent = self.agent(requires_tools=("read",), mode=AgentMode.SUBAGENT)
+        rule = self.value(agent)["permission"]["external_directory"]
+        self.assertEqual(
+            rule,
+            {
+                "*": "allow",
+                f"{CONFIG.as_posix()}/skills/*": "allow",
+                **render_module.EXTERNAL_DIRECTORY_DENY_FLOOR,
+            },
+        )
+
+    def test_a_primary_readers_external_directory_baseline_is_allow_not_ask(self):
+        """A primary agent has a person present to answer a prompt, and even
+        carries the `ask` tool itself -- but the baseline no longer relies on
+        that: it is `"allow"` for every agent regardless of depth, a
+        deliberate product decision surfaced by upstream issue #39112 (see
+        `_permission`'s docstring).
+        """
+        agent = self.agent(requires_tools=("read",), mode=AgentMode.PRIMARY)
+        rule = self.value(agent)["permission"]["external_directory"]
+        self.assertEqual(
+            rule,
+            {
+                "*": "allow",
+                f"{CONFIG.as_posix()}/skills/*": "allow",
+                **render_module.EXTERNAL_DIRECTORY_DENY_FLOOR,
+            },
+        )
+
+    def test_the_grant_refuses_every_other_path_outside_the_worktree(self):
+        """The exception carries its own baseline.
+
+        Now `"allow"` rather than `"ask"` (see
+        `test_a_subagents_external_directory_baseline_is_allow_not_ask`), but
+        the boundary this entry exists to draw should still be readable in
+        the entry itself, not inferred from the absence of a rule two keys
+        above.
+        """
+        rule = self.value(self.agent(requires_tools=("read",)))["permission"]["external_directory"]
+        self.assertEqual(rule["*"], "allow")
+        self.assertEqual(next(iter(rule)), "*", "the baseline must precede the one path it excepts")
+
+    def test_the_settings_file_is_not_something_a_shipped_agent_may_read(self):
+        """The config directory holds the settings file, and the settings file
+        holds whatever a server the user administers was configured with. The
+        grant stops at the skills directory for that reason, so widening it back
+        to the config root has to fail here.
+        """
+        rule = self.value(self.agent(requires_tools=("read",)))["permission"]["external_directory"]
+        self.assertNotIn(f"{CONFIG.as_posix()}/*", rule)
+
+    def test_grep_glob_edit_write_and_bash_earn_the_same_grant_read_does(self):
+        """They ask under the same permission name, for the same reason."""
+        for tool in ("grep", "glob", "edit", "write", "bash"):
+            with self.subTest(tool=tool):
+                permission = self.value(self.agent(requires_tools=(tool,)))["permission"]
+                self.assertIn("external_directory", permission)
+
+    def test_an_agent_that_touches_no_path_at_all_is_granted_no_way_out(self):
+        """Declaring nothing keeps meaning nothing: only a tool that actually
+        asks under this name can earn it -- `skill` and `ask` never do."""
+        permission = self.value(self.agent(requires_tools=("skill",)))["permission"]
+        self.assertNotIn("external_directory", permission)
+
+    def test_a_subagent_with_bash_and_no_read_still_earns_the_grant(self):
+        """The bug reported from real use: a sub-agent declaring `bash` and
+        `write` but no `read` used to render no `external_directory` key at
+        all, falling through to the outer `"*": "deny"` baseline -- worse than
+        the `"ask"` it should have gotten, since `bash` genuinely does call
+        `assertExternalDirectory` in the runtime.
+        """
+        permission = self.value(
+            self.agent(requires_tools=("bash", "write"), mode=AgentMode.SUBAGENT)
+        )["permission"]
+        self.assertIn("external_directory", permission)
+        self.assertEqual(permission["external_directory"]["*"], "allow")
+
+    def test_a_granted_directory_is_allowed_after_the_baseline_and_the_skills_exception(self):
+        agent = self.agent(requires_tools=("read",), granted_directories=("/home/probe/worktrees/extra",))
+        rule = self.value(agent)["permission"]["external_directory"]
+        self.assertEqual(
+            rule,
+            {
+                "*": "allow",
+                f"{CONFIG.as_posix()}/skills/*": "allow",
+                "/home/probe/worktrees/extra/*": "allow",
+                **render_module.EXTERNAL_DIRECTORY_DENY_FLOOR,
+            },
+        )
+        keys = list(rule)
+        self.assertEqual(keys[0], "*")
+        self.assertEqual(
+            keys[-len(render_module.EXTERNAL_DIRECTORY_DENY_FLOOR) - 1],
+            "/home/probe/worktrees/extra/*",
+            "order is what makes a grant win",
+        )
+        self.assertEqual(
+            keys[-len(render_module.EXTERNAL_DIRECTORY_DENY_FLOOR) :],
+            list(render_module.EXTERNAL_DIRECTORY_DENY_FLOOR),
+            "the deny floor must be written last so nothing can out-rank it",
+        )
+
+    def test_a_granted_directory_reaches_a_subagent_too(self):
+        """A working directory a sub-agent needs is exactly the case this
+        mechanism exists for -- see `sdd-verify`'s own report."""
+        agent = self.agent(
+            requires_tools=("bash",), mode=AgentMode.SUBAGENT, granted_directories=("/home/probe/worktrees/extra",)
+        )
+        rule = self.value(agent)["permission"]["external_directory"]
+        self.assertEqual(rule["/home/probe/worktrees/extra/*"], "allow")
+
+    def test_a_granted_directory_earns_the_key_even_for_an_agent_that_would_not_otherwise_trigger_it(self):
+        """A directory the person explicitly granted must reach an agent that
+        only, say, writes -- `skill` alone would render no `external_directory`
+        key at all otherwise."""
+        agent = self.agent(requires_tools=("skill",), granted_directories=("/home/probe/worktrees/extra",))
+        permission = self.value(agent)["permission"]
+        self.assertIn("external_directory", permission)
+        self.assertEqual(permission["external_directory"]["*"], "allow")
+        self.assertEqual(permission["external_directory"]["/home/probe/worktrees/extra/*"], "allow")
+
+    def test_no_granted_directories_means_no_extra_entries(self):
+        agent = self.agent(requires_tools=("read",))
+        rule = self.value(agent)["permission"]["external_directory"]
+        self.assertEqual(
+            rule,
+            {
+                "*": "allow",
+                f"{CONFIG.as_posix()}/skills/*": "allow",
+                **render_module.EXTERNAL_DIRECTORY_DENY_FLOOR,
+            },
+        )
+
+    def test_the_external_directory_deny_floor_has_no_file_shaped_pattern(self):
+        """The runtime always evaluates `path.dirname(target) + "/*"` for this
+        permission (`packages/opencode/src/tool/external-directory.ts`), never
+        the file path itself, so a file-shaped pattern such as `*.pem`,
+        `*.key`, or an entry ending in `.env` can never match anything this
+        permission is ever asked to evaluate. Such a pattern would be a guard
+        that protects nothing, so the floor must not contain one.
+        """
+        for pattern in render_module.EXTERNAL_DIRECTORY_DENY_FLOOR:
+            self.assertFalse(pattern.endswith(".pem"), pattern)
+            self.assertFalse(pattern.endswith(".key"), pattern)
+            self.assertFalse(pattern.endswith(".env"), pattern)
+            self.assertNotIn(".env.", pattern)
+            self.assertTrue(pattern.endswith("/*"), f"{pattern}: only a directory-shaped pattern can ever match")
+
+    def test_every_deny_floor_entry_is_deny(self):
+        for pattern, value in render_module.EXTERNAL_DIRECTORY_DENY_FLOOR.items():
+            self.assertEqual(value, "deny", pattern)
+
+    def test_a_granted_directory_overlapping_the_deny_floor_still_resolves_to_the_floor(self):
+        """`findLast` resolution means order, not presence, decides the
+        winner: the runtime evaluates the target path against every rule
+        pattern that matches it and keeps the *last* one written, so a grant
+        and a floor entry that are two distinct strings can still both match
+        the identical runtime target. Proving the floor wins needs the
+        *order* of the rendered keys, not merely that both are present --
+        presence alone says nothing about which one `findLast` would pick.
+
+        `/home/probe/.ssh` is a directory a person could plausibly grant
+        (`hpl directory grant`) that a real ask target inside it,
+        `/home/probe/.ssh/*`, would match under *both* the grant's own key
+        (`/home/probe/.ssh/*`, exact) and the floor's key (`*/.ssh/*`,
+        wildcard) -- two different pattern strings, same target.
+        """
+        agent = self.agent(requires_tools=("read",), granted_directories=("/home/probe/.ssh",))
+        rule = self.value(agent)["permission"]["external_directory"]
+        grant_pattern = "/home/probe/.ssh/*"
+        floor_pattern = "*/.ssh/*"
+        self.assertEqual(rule[grant_pattern], "allow", "the grant is rendered as its own, more specific pattern")
+        self.assertEqual(rule[floor_pattern], "deny")
+        keys = list(rule)
+        self.assertGreater(
+            keys.index(floor_pattern),
+            keys.index(grant_pattern),
+            "the floor must be written after the grant so findLast resolves the target to deny",
+        )
+        floor_size = len(render_module.EXTERNAL_DIRECTORY_DENY_FLOOR)
+        self.assertEqual(
+            keys[-floor_size:],
+            list(render_module.EXTERNAL_DIRECTORY_DENY_FLOOR),
+            "the whole floor, in its own order, must be the trailing block -- after every grant",
+        )
+
+    def test_the_permission_deny_baseline_is_written_before_anything_it_would_lose_to(self):
+        """Same resolution rule as `_tools`: the runtime keeps the *last*
+        matching rule, so `"*": "deny"` only beats a grant that comes after it.
+        """
+        agent = self.agent(requires_tools=("read",), optional_mcp=("context7",))
+        keys = list(self.value(agent)["permission"])
+        self.assertEqual(keys[0], "*", f"the deny baseline must come first, got {keys}")
+        self.assertGreater(len(keys), 1, "a baseline with nothing after it grants nothing")
+
+    def test_the_agent_a_session_starts_in_becomes_the_default(self):
+        starts = content_module.SESSION_STARTS_IN
+        artifacts = self.adapter.render_agent(
+            self.layout,
+            self.agent(
+                name=starts,
+                mode=AgentMode.PRIMARY,
+                source=PurePosixPath(f"agents/{starts}.md"),
+            ),
+            mcp=(),
+        )
+        default = [item for item in artifacts if item.pointer == "/default_agent"]
+        self.assertEqual([item.value for item in default], [starts])
+
+    def test_another_primary_agent_does_not_touch_the_default(self):
+        """Being selectable at top level is one thing; being where a session opens is another."""
+        artifacts = self.adapter.render_agent(self.layout, self.agent(mode=AgentMode.PRIMARY), mcp=())
+        self.assertEqual([item for item in artifacts if item.pointer == "/default_agent"], [])
+
+    def test_the_real_mode_still_reaches_the_agent_entry(self):
+        self.assertEqual(self.value(self.agent(mode=AgentMode.PRIMARY))["mode"], "primary")
+        self.assertEqual(self.value(self.agent())["mode"], "subagent")
+
+    def test_a_subagent_does_not_touch_the_default(self):
+        artifacts = self.adapter.render_agent(self.layout, self.agent(), mcp=())
+        self.assertEqual([item for item in artifacts if item.pointer == "/default_agent"], [])
+
+    def test_the_prompt_is_a_file_of_its_own(self):
+        artifact = self.adapter.render_prompt(self.layout, self.agent())[0]
+        self.assertEqual(artifact.path, CONFIG / "prompts/sdd-verify.md")
+        self.assertEqual(artifact.content, b"# Verify\n\nProve it.\n")
+
+    def test_no_model_key_when_nothing_was_assigned(self):
+        self.assertNotIn("model", self.value(self.agent()))
+
+    def test_a_resolved_model_is_written_into_the_agent_entry(self):
+        artifacts = self.adapter.render_agent(
+            self.layout, self.agent(), ModelAssignment("anthropic", "claude-sonnet-5"), mcp=()
+        )
+        value = only(artifacts, ConfigKeyArtifact)[0].value
+        self.assertEqual(value["model"], "anthropic/claude-sonnet-5")
+
+    def test_no_variant_key_when_the_assignment_carries_no_effort(self):
+        artifacts = self.adapter.render_agent(
+            self.layout, self.agent(), ModelAssignment("anthropic", "claude-sonnet-5"), mcp=()
+        )
+        value = only(artifacts, ConfigKeyArtifact)[0].value
+        self.assertNotIn("variant", value)
+
+    def test_an_effort_is_written_as_this_clis_own_variant_key(self):
+        """`variant` is OpenCode's own schema word for a model's reasoning effort --
+        this adapter's job to spell, never the engine's."""
+        artifacts = self.adapter.render_agent(
+            self.layout, self.agent(), ModelAssignment("anthropic", "claude-sonnet-5", effort="high"), mcp=()
+        )
+        value = only(artifacts, ConfigKeyArtifact)[0].value
+        self.assertEqual(value["model"], "anthropic/claude-sonnet-5")
+        self.assertEqual(value["variant"], "high")
+
+
+class ApplyPatchPermissionFoldTest(unittest.TestCase):
+    """`apply_patch` must never appear in either translation table.
+
+    The runtime folds `edit`, `write` and `apply_patch` onto one `edit`
+    permission before it ever consults `tools` or `permission`
+    (`packages/opencode/src/permission/index.ts`), and its config loader
+    keys a declared permission off the literal `"patch"`, not
+    `"apply_patch"` (`packages/core/src/v1/config/agent.ts`, `normalize`).
+    So naming `apply_patch` in either table -- as a source key HPL
+    declares, or as a target any HPL tool name maps to -- would render a
+    key the runtime never reads: a silent no-op that looks like a
+    restriction and is not one. See `render._tools` and `render._permission`
+    for the full account.
+    """
+
+    MESSAGE = (
+        "apply_patch must not appear in {table}: the runtime folds edit, "
+        "write and apply_patch onto a single `edit` permission before it "
+        "ever consults this table, and its config loader keys a declared "
+        "permission off the literal `patch`, not `apply_patch` -- so adding "
+        "it here renders a key nothing reads, a silent no-op, not a "
+        "restriction. See render.py's `_tools` and `_permission` docstrings "
+        "for the full account of the fold."
+    )
+
+    def test_apply_patch_is_not_a_source_key_in_tool_name(self):
+        self.assertNotIn(
+            "apply_patch", render_module.TOOL_NAME, self.MESSAGE.format(table="TOOL_NAME")
+        )
+
+    def test_apply_patch_is_not_a_source_key_in_permission_name(self):
+        self.assertNotIn(
+            "apply_patch", render_module.PERMISSION_NAME, self.MESSAGE.format(table="PERMISSION_NAME")
+        )
+
+    def test_no_hpl_tool_name_maps_to_apply_patch_in_tool_name(self):
+        offending = [key for key, value in render_module.TOOL_NAME.items() if value == "apply_patch"]
+        self.assertEqual(offending, [], self.MESSAGE.format(table="TOOL_NAME"))
+
+    def test_no_hpl_tool_name_maps_to_apply_patch_in_permission_name(self):
+        offending = [
+            key for key, value in render_module.PERMISSION_NAME.items() if value == "apply_patch"
+        ]
+        self.assertEqual(offending, [], self.MESSAGE.format(table="PERMISSION_NAME"))
+
+
+class CommandRenderTest(unittest.TestCase):
+    def setUp(self):
+        self.adapter = Adapter()
+        self.layout = self.adapter.layout(ENVIRONMENT)
+
+    def rendered(self, **overrides):
+        fields = dict(
+            name="sdd-apply",
+            description="Implement SDD tasks",
+            body="Do the work.\n",
+            runs_as=RunsAs.ORCHESTRATOR,
+            execution=Execution.ISOLATED,
+            source=PurePosixPath("commands/sdd-apply.md"),
+        )
+        fields.update(overrides)
+        return self.adapter.render_command(self.layout, Command(**fields), "hpl-orchestrator")[0].content.decode()
+
+    def test_lands_in_the_commands_directory(self):
+        artifact = self.adapter.render_command(
+            self.layout,
+            Command(
+                name="sdd-apply",
+                description="d",
+                body="b\n",
+                runs_as=RunsAs.DEFAULT,
+                execution=Execution.INLINE,
+                source=PurePosixPath("commands/sdd-apply.md"),
+            ),
+            "hpl-orchestrator",
+        )[0]
+        self.assertEqual(artifact.path, CONFIG / "commands/sdd-apply.md")
+
+    def test_the_orchestrator_role_becomes_the_hpl_agent(self):
+        self.assertIn("agent: \"hpl-orchestrator\"", self.rendered())
+
+    def test_the_orchestrator_role_names_the_content_declared_orchestrator(self):
+        """The `agent:` field for `RunsAs.ORCHESTRATOR` must come from whatever
+        name the loaded content declares as its own orchestrator, not from a
+        literal baked into this module -- proven in-process by substituting a
+        different name and observing it come out the other end, unlike
+        `SESSION_STARTS_IN`, which is fixed at import time and only varies
+        across a subprocess with a copied package tree.
+        """
+        item = Command(
+            name="sdd-apply",
+            description="Implement SDD tasks",
+            body="Do the work.\n",
+            runs_as=RunsAs.ORCHESTRATOR,
+            execution=Execution.ISOLATED,
+            source=PurePosixPath("commands/sdd-apply.md"),
+        )
+        content = render_module.command(self.layout, item, "king-hpl-two")[0].content.decode()
+        self.assertIn('agent: "king-hpl-two"', content)
+        self.assertNotIn("hpl-orchestrator", content)
+
+    def test_planner_and_builder_become_opencode_native_agents(self):
+        self.assertIn('agent: "plan"', self.rendered(runs_as=RunsAs.PLANNER))
+        self.assertIn('agent: "build"', self.rendered(runs_as=RunsAs.BUILDER))
+
+    def test_the_default_role_omits_the_key(self):
+        self.assertNotIn("agent:", self.rendered(runs_as=RunsAs.DEFAULT))
+
+    def test_isolated_execution_becomes_subtask(self):
+        self.assertIn("subtask: true", self.rendered())
+
+    def test_inline_execution_omits_subtask(self):
+        self.assertNotIn("subtask", self.rendered(execution=Execution.INLINE))
+
+    def test_the_body_survives_untouched(self):
+        self.assertTrue(self.rendered().endswith("Do the work.\n"))
+
+    def test_a_description_with_a_colon_stays_valid(self):
+        rendered = self.rendered(description="Trigger: do it now")
+        self.assertIn('description: "Trigger: do it now"', rendered)
+
+
+class SystemPromptRenderTest(unittest.TestCase):
+    def render(self, prompt: SystemPrompt):
+        return self.adapter.render_system_prompt(self.layout, prompt, IDENTITY)
+
+    def setUp(self):
+        self.adapter = Adapter()
+        self.layout = self.adapter.layout(ENVIRONMENT)
+        self.artifacts = self.render(
+            SystemPrompt(body="# Rules\n", source=PurePosixPath("system-prompt/AGENTS.md"))
+        )
+
+    def test_ships_its_own_file(self):
+        file_artifact = only(self.artifacts, FileArtifact)[0]
+        self.assertEqual(file_artifact.path, CONFIG / "hpl-AGENTS.md")
+
+    def test_wires_itself_in_by_appending_to_the_instructions_list(self):
+        key = only(self.artifacts, ConfigKeyArtifact)[0]
+        self.assertEqual(key.pointer, "/instructions/-")
+
+    def test_names_the_file_by_its_absolute_path(self):
+        """A relative entry in this list is resolved against the project being
+        worked in, not against the directory the config lives in -- so a
+        `./hpl-AGENTS.md` written into the global configuration names a
+        file that exists nowhere the runtime will look, and the whole system
+        prompt is silently never loaded. The absolute path is the only spelling
+        that means the file HPL actually placed.
+        """
+        key = only(self.artifacts, ConfigKeyArtifact)[0]
+        self.assertEqual(key.value, str(CONFIG / "hpl-AGENTS.md"))
+
+    def _body_of(self, prompt: SystemPrompt) -> str:
+        return only(self.render(prompt), FileArtifact)[0].content.decode("utf-8")
+
+    def test_a_prompt_with_no_section_is_shipped_as_written(self):
+        body = self._body_of(
+            SystemPrompt(body="# Rules\n", source=PurePosixPath("system-prompt/AGENTS.md"))
+        )
+        self.assertEqual(body, "# Rules\n")
+
+    def test_each_section_is_appended_after_the_base_body(self):
+        body = self._body_of(
+            SystemPrompt(
+                body="# Rules\n",
+                source=PurePosixPath("system-prompt/AGENTS.md"),
+                mcp_sections=(
+                    content_module.McpSection(
+                        name="alpha",
+                        body="# Alpha\n",
+                        source=PurePosixPath("system-prompt/mcp/alpha.md"),
+                    ),
+                    content_module.McpSection(
+                        name="beta",
+                        body="# Beta\n",
+                        source=PurePosixPath("system-prompt/mcp/beta.md"),
+                    ),
+                ),
+            )
+        )
+        self.assertEqual(body, "# Rules\n\n# Alpha\n\n# Beta\n")
+
+    def test_a_section_gets_the_same_placeholders_answered_as_the_body(self):
+        body = self._body_of(
+            SystemPrompt(
+                body="# Rules\n",
+                source=PurePosixPath("system-prompt/AGENTS.md"),
+                mcp_sections=(
+                    content_module.McpSection(
+                        name="alpha",
+                        body="Detail lives in {{skills_root}}/_shared/mcp/alpha-convention.md.\n",
+                        source=PurePosixPath("system-prompt/mcp/alpha.md"),
+                    ),
+                ),
+            )
+        )
+        self.assertIn(str(CONFIG / "skills" / "_shared" / "mcp" / "alpha-convention.md"), body)
+
+
+class McpRenderTest(unittest.TestCase):
+    def setUp(self):
+        self.adapter = Adapter()
+        self.layout = self.adapter.layout(ENVIRONMENT)
+        self.mcp = Mcp(
+            name="context7",
+            description="d",
+            body="# Context7 Convention\n",
+            distribution=Distribution.REMOTE,
+            endpoint="https://mcp.context7.com/mcp",
+            source=PurePosixPath("mcp/context7.md"),
+        )
+        self.artifacts = self.adapter.render_mcp(self.layout, self.mcp)
+
+    def test_renders_exactly_two_artifacts(self):
+        self.assertEqual(len(self.artifacts), 2)
+
+    def test_the_server_is_a_configuration_key(self):
+        key = only(self.artifacts, ConfigKeyArtifact)[0]
+        self.assertEqual(key.pointer, "/mcp/context7")
+        self.assertEqual(key.path, self.layout.settings_file)
+
+    def test_a_remote_server_carries_no_headers(self):
+        key = only(self.artifacts, ConfigKeyArtifact)[0]
+        self.assertEqual(
+            key.value,
+            {"type": "remote", "url": "https://mcp.context7.com/mcp", "enabled": True},
+        )
+
+    def test_the_convention_lands_under_shared_skills(self):
+        file_artifact = only(self.artifacts, FileArtifact)[0]
+        self.assertEqual(
+            file_artifact.path,
+            self.layout.skills_dir / "_shared" / "mcp" / "context7-convention.md",
+        )
+        self.assertEqual(file_artifact.content, b"# Context7 Convention\n")
+
+    def test_the_dispatch_table_covers_every_distribution_member(self):
+        self.assertEqual(set(render_module.MCP_VALUE), set(Distribution))
+
+    def test_a_layout_without_skills_refuses_instead_of_an_attribute_error(self):
+        layout = Layout(config_dir=CONFIG, settings_file=CONFIG / "opencode.json")
+        with self.assertRaises(render_module.RenderError) as raised:
+            render_module.mcp(layout, self.mcp)
+        self.assertIn("context7", str(raised.exception))
+
+
+class DownloadMcpRenderTest(unittest.TestCase):
+    def setUp(self):
+        self.adapter = Adapter()
+        self.environment = Environment(home=HOME, data_dir=HOME / ".local" / "share" / "hpl")
+        self.layout = self.adapter.layout(self.environment)
+        self.mcp = Mcp(
+            name="probe",
+            description="d",
+            body="# Probe Convention\n",
+            distribution=Distribution.DOWNLOAD,
+            endpoint="https://example.test/releases/probe-linux-x64",
+            source=PurePosixPath("mcp/probe.md"),
+            version="1.2.3",
+            checksum="sha256:" + "a" * 64,
+        )
+        self.artifacts = self.adapter.render_mcp(self.layout, self.mcp)
+
+    def test_the_server_points_at_a_local_command(self):
+        key = only(self.artifacts, ConfigKeyArtifact)[0]
+        self.assertEqual(key.pointer, "/mcp/probe")
+        self.assertEqual(
+            key.value,
+            {
+                "type": "local",
+                "command": [
+                    str(
+                        self.environment.data_dir
+                        / "mcp"
+                        / "probe"
+                        / "1.2.3"
+                        / "probe-linux-x64"
+                    )
+                ],
+                "enabled": True,
+            },
+        )
+
+    def test_a_layout_without_a_dependencies_directory_refuses(self):
+        layout = Layout(config_dir=CONFIG, settings_file=CONFIG / "opencode.json", skills_dir=CONFIG / "skills")
+        with self.assertRaises(render_module.RenderError) as raised:
+            render_module.mcp(layout, self.mcp)
+        self.assertIn("probe", str(raised.exception))
+
+    def test_argv_is_appended_in_order_after_the_command(self):
+        mcp = replace(self.mcp, argv=("mcp", "--tools=agent"))
+        artifacts = self.adapter.render_mcp(self.layout, mcp)
+        key = only(artifacts, ConfigKeyArtifact)[0]
+        self.assertEqual(
+            key.value["command"],
+            [
+                str(
+                    self.environment.data_dir
+                    / "mcp"
+                    / "probe"
+                    / "1.2.3"
+                    / "probe-linux-x64"
+                ),
+                "mcp",
+                "--tools=agent",
+            ],
+        )
+
+
+class ArchiveDownloadMcpRenderTest(unittest.TestCase):
+    """An archive's own asset, the `.tar.gz` itself, is never what a CLI's
+    configuration should point at -- the command has to name the member
+    inside it that is the program, not the fetched file's own name."""
+
+    def setUp(self):
+        self.adapter = Adapter()
+        self.environment = Environment(home=HOME, data_dir=HOME / ".local" / "share" / "hpl")
+        self.layout = self.adapter.layout(self.environment)
+        self.mcp = Mcp(
+            name="probe",
+            description="d",
+            body="# Probe Convention\n",
+            distribution=Distribution.DOWNLOAD,
+            endpoint="https://example.test/releases/probe-linux-x64.tar.gz",
+            source=PurePosixPath("mcp/probe.md"),
+            version="1.2.3",
+            checksum="sha256:" + "a" * 64,
+            archive_members=("CHANGELOG.md", "probe"),
+            archive_executable="probe",
+        )
+        self.artifacts = self.adapter.render_mcp(self.layout, self.mcp)
+
+    def test_the_server_points_at_the_declared_executable_member(self):
+        key = only(self.artifacts, ConfigKeyArtifact)[0]
+        self.assertEqual(
+            key.value["command"],
+            [str(self.environment.data_dir / "mcp" / "probe" / "1.2.3" / "probe")],
+        )
+
+
+class NpmMcpRenderTest(unittest.TestCase):
+    def setUp(self):
+        self.adapter = Adapter()
+        self.environment = Environment(home=HOME, data_dir=HOME / ".local" / "share" / "hpl")
+        self.layout = self.adapter.layout(self.environment)
+        self.mcp = Mcp(
+            name="probe",
+            description="d",
+            body="# Probe Convention\n",
+            distribution=Distribution.NPM,
+            endpoint="https://registry.npmjs.org/probe-mcp/-/probe-mcp-1.2.3.tgz",
+            source=PurePosixPath("mcp/probe.md"),
+            version="1.2.3",
+            package="probe-mcp",
+            integrity="sha512-" + "a" * 86 + "==",
+            entry="cli.js",
+        )
+        self.artifacts = self.adapter.render_mcp(self.layout, self.mcp)
+
+    def test_the_server_points_at_the_installed_script(self):
+        key = only(self.artifacts, ConfigKeyArtifact)[0]
+        self.assertEqual(key.pointer, "/mcp/probe")
+        self.assertEqual(
+            key.value,
+            {
+                "type": "local",
+                "command": [
+                    str(
+                        self.environment.data_dir
+                        / "mcp"
+                        / "probe"
+                        / "1.2.3"
+                        / "node_modules"
+                        / "probe-mcp"
+                        / "cli.js"
+                    )
+                ],
+                "enabled": True,
+            },
+        )
+
+    def test_a_layout_without_a_dependencies_directory_refuses(self):
+        layout = Layout(config_dir=CONFIG, settings_file=CONFIG / "opencode.json", skills_dir=CONFIG / "skills")
+        with self.assertRaises(render_module.RenderError) as raised:
+            render_module.mcp(layout, self.mcp)
+        self.assertIn("probe", str(raised.exception))
+
+    def test_argv_is_appended_in_order_after_the_installed_script(self):
+        mcp = replace(self.mcp, argv=("serve",))
+        artifacts = self.adapter.render_mcp(self.layout, mcp)
+        key = only(artifacts, ConfigKeyArtifact)[0]
+        self.assertEqual(
+            key.value["command"],
+            [
+                str(
+                    self.environment.data_dir
+                    / "mcp"
+                    / "probe"
+                    / "1.2.3"
+                    / "node_modules"
+                    / "probe-mcp"
+                    / "cli.js"
+                ),
+                "serve",
+            ],
+        )
+
+
+class ShippedEngramCommandTest(unittest.TestCase):
+    """`engram`'s binary prints usage and exits when started with no
+    arguments; the real shipped descriptor must render the command that
+    actually starts its MCP server."""
+
+    def setUp(self):
+        self.adapter = Adapter()
+        self.environment = Environment(home=HOME, data_dir=HOME / ".local" / "share" / "hpl")
+        self.layout = self.adapter.layout(self.environment)
+        self.engram = next(item for item in content_module.load().mcp if item.name == "engram")
+        self.artifacts = self.adapter.render_mcp(self.layout, self.engram)
+
+    def test_the_rendered_command_starts_the_mcp_server(self):
+        key = only(self.artifacts, ConfigKeyArtifact)[0]
+        self.assertEqual(key.value["command"][1:], ["mcp", "--tools=agent"])
+
+
+class OwnArtifactsIdentityPlumbingTest(unittest.TestCase):
+    """`own_artifacts` must receive its `Identity` explicitly -- it has no way
+    to look one up on its own, and this is what proves it: the parameter is
+    required, so calling it without one is a `TypeError`, not a silent fall
+    back to some constant the adapter reached for by itself."""
+
+    def test_identity_is_a_required_parameter_not_a_default(self):
+        layout = Adapter().layout(ENVIRONMENT)
+        with self.assertRaises(TypeError):
+            Adapter().own_artifacts(layout, ORCHESTRATOR)
+
+    def test_own_artifacts_never_imports_identity_or_identity_json(self):
+        """The adapter module itself must never know how to find an
+        `identity.json` or read `hpl.core.identity.parse`; it may only
+        receive an already-resolved `Identity` value through this parameter."""
+        source = Path(adapter_module.__file__).read_text(encoding="utf-8")
+        self.assertNotIn("identity.json", source)
+        self.assertNotIn("identity_module.parse", source)
+        self.assertNotIn(".parse(", source)
+
+
+class OwnArtifactsDelegationTargetsPlumbingTest(unittest.TestCase):
+    """`own_artifacts` must receive `delegation_targets` explicitly, the same
+    way `OwnArtifactsIdentityPlumbingTest` pins `identity`: a default here
+    would let a future refactor drop the argument at the one production call
+    site (`core.catalog.render`) and still render a plausible-looking file --
+    with zero rows -- instead of failing loudly at the call."""
+
+    def test_delegation_targets_is_a_required_parameter_not_a_default(self):
+        layout = Adapter().layout(ENVIRONMENT)
+        with self.assertRaises(TypeError):
+            Adapter().own_artifacts(layout, ORCHESTRATOR, IDENTITY)
+
+
+class OwnArtifactsTest(unittest.TestCase):
+    def setUp(self):
+        self.layout = Adapter().layout(ENVIRONMENT)
+        self.artifacts = Adapter().own_artifacts(self.layout, ORCHESTRATOR, IDENTITY, ())
+        self.files = {item.path: item for item in only(self.artifacts, FileArtifact)}
+
+    def test_ships_the_adapter_only_assets(self):
+        # 13, not 12: `own_artifacts` now also emits the generated
+        # delegation-capabilities reference (`render.delegation_capabilities`),
+        # unconditionally, the same way it emits every other file here.
+        # 15, not 13: credential transport adds two files, both
+        # gated on `credential_transport().any` -- the `secret-transport.ts`
+        # plugin and its sidecar detection catalog -- and this adapter
+        # declares every operation, so both ship here.
+        self.assertEqual(len(only(self.artifacts, FileArtifact)), 15)
+
+    def test_build_leftovers_are_excluded(self):
+        self.assertEqual([item for item in self.artifacts if "__pycache__" in str(item.path)], [])
+
+    def test_the_skill_registry_helper_lives_under_a_hpl_subtree(self):
+        paths = {item.path for item in only(self.artifacts, FileArtifact)}
+        self.assertIn(CONFIG / "hpl/skill-registry/hpl_skill_registry.py", paths)
+
+    def test_plugins_land_in_the_plugin_directory(self):
+        paths = {item.path for item in only(self.artifacts, FileArtifact)}
+        self.assertIn(CONFIG / "plugins/engram.ts", paths)
+
+    def test_settings_are_appended_not_replaced(self):
+        pointers = {item.pointer for item in only(self.artifacts, ConfigKeyArtifact)}
+        self.assertEqual(
+            pointers, {"/skills/paths/-", "/plugin/-", "/share", "/subagent_depth"}
+        )
+
+    def test_subagent_depth_is_rendered_as_ten(self):
+        """10 is a circuit breaker, not a policy: high enough never to bind in
+        real work, finite so a pathological delegation loop still terminates."""
+        keys = {item.pointer: item.value for item in only(self.artifacts, ConfigKeyArtifact)}
+        self.assertEqual(keys["/subagent_depth"], 10)
+
+    def test_everything_stays_inside_the_configuration_root(self):
+        for item in self.artifacts:
+            self.assertTrue(item.path.is_relative_to(self.layout.config_dir), item.path)
+
+    def test_no_shipped_asset_carries_an_installing_machine_s_absolute_path(self):
+        """The complement of filling placeholders: what an asset must NOT come out holding.
+
+        Substitution runs over an asset's whole text, comments included, so a comment
+        that merely *mentions* a placeholder gets rewritten too -- which is how a real
+        installing home's `skills_root` ended up baked into the notifier's own
+        documentation. No bundled asset needs a layout path today, and one that came to
+        need it would be relaxing this guard on purpose rather than by accident.
+
+        Scoped to the assets that ship from the tree, computed from the same walk
+        `own_artifacts` uses rather than by exempting an id: the skill-registry `.env`
+        file (named `f"{identity.program_name}-skill-registry.env"`, not a fixed
+        literal) is synthesized at install time and legitimately *is* nothing but
+        layout paths. Both halves are derived -- the anchors from the layout, the
+        asset ids from the asset tree -- so a new layout anchor or a new bundled
+        asset is covered without this test being touched.
+        """
+        anchors = {
+            name: value
+            for name, value in vars(self.layout).items()
+            if isinstance(value, PurePath)
+        }
+        self.assertTrue(anchors, "the layout exposes no paths; this test would prove nothing")
+        bundled = {
+            f"own:{group}/{adapter_module._installed_relative(relative, IDENTITY)}"
+            for group in adapter_module.ASSET_TARGETS
+            for _path, relative in adapter_module._asset_files(adapter_module.ASSETS / group)
+        }
+        self.assertTrue(bundled, "no bundled assets found; this test would prove nothing")
+        for item in only(self.artifacts, FileArtifact):
+            if item.id not in bundled:
+                continue
+            text = item.content.decode("utf-8", errors="ignore")
+            for name, value in anchors.items():
+                self.assertNotIn(
+                    str(value), text, f"{item.id} carries the layout's {name} ({value})"
+                )
+
+
+    def test_only_the_assets_the_tree_marks_executable_become_executable(self):
+        """The tree already records which file is a program; nothing else earns the bit."""
+        executable = {
+            item.path.name for item in only(self.artifacts, FileArtifact) if item.executable
+        }
+        self.assertEqual(executable, {"hpl-skill-registry"})
+
+    def test_the_result_is_deterministic(self):
+        self.assertEqual(
+            Adapter().own_artifacts(self.layout, ORCHESTRATOR, IDENTITY, ()),
+            Adapter().own_artifacts(self.layout, ORCHESTRATOR, IDENTITY, ()),
+        )
+
+    def test_the_shipped_notifier_names_the_content_declared_orchestrator(self):
+        """The positive half of the mirror: the notifier plugin must actually
+        carry whatever name content declares as its orchestrator, not just
+        fail to carry the old literal (that half is `test_no_asset_ships_...
+        hpl_orchestrator_literal` below)."""
+        notifier = next(item for item in only(self.artifacts, FileArtifact) if item.path.name == "hpl-orchestrator-notifier.ts")
+        self.assertIn(f'"{ORCHESTRATOR}"', notifier.content.decode("utf-8"))
+
+    def test_a_non_hpl_orchestrator_name_reaches_the_notifier(self):
+        """The negative half: a distribution's own orchestrator name must
+        substitute cleanly, and the old literal must not survive alongside it."""
+        artifacts = Adapter().own_artifacts(self.layout, "king-hpl-two", IDENTITY, ())
+        notifier = next(item for item in only(artifacts, FileArtifact) if item.path.name == "hpl-orchestrator-notifier.ts")
+        content = notifier.content.decode("utf-8")
+        self.assertIn('"king-hpl-two"', content)
+        self.assertNotIn("hpl-orchestrator", content)
+
+    def test_the_apply_patch_scope_plugin_ships_under_the_derived_name(self):
+        """Like every other plugin this adapter bundles, its installed filename
+        is this distribution's own, never the source filename it ships as."""
+        paths = {item.path for item in only(self.artifacts, FileArtifact)}
+        self.assertIn(CONFIG / f"plugins/{IDENTITY.program_name}-apply-patch-scope.ts", paths)
+
+    def test_the_apply_patch_scope_plugin_declares_its_hook_and_guards_the_tool_id(self):
+        """The two facts that make the plugin do anything at all: it registers
+        on the one hook that writes the description sent with a tool definition,
+        and it touches nothing but `apply_patch`. A plugin that renders cleanly
+        while hooking nothing would pass every other test here."""
+        plugin = self.files[CONFIG / f"plugins/{IDENTITY.program_name}-apply-patch-scope.ts"]
+        source = plugin.content.decode("utf-8")
+        self.assertIn('"tool.definition"', source)
+        self.assertIn('input.toolID !== "apply_patch"', source)
+
+    def rendered_apply_patch_scope(self) -> str:
+        """The installed plugin's own (placeholder-filled) content."""
+        plugin = self.files[CONFIG / f"plugins/{IDENTITY.program_name}-apply-patch-scope.ts"]
+        return plugin.content.decode("utf-8")
+
+    def test_the_scope_note_is_reconstructible_at_all(self):
+        """Everything below reads the rebuilt note; an empty one proves nothing."""
+        note = scope_note_of(self.rendered_apply_patch_scope())
+        self.assertTrue(note.strip(), "the SCOPE_NOTE array could not be read")
+        self.assertRegex(note, NOTE_IS_LOCAL_ONLY)
+        self.assertRegex(note, NOTE_NOT_A_BAN_ON_THE_SHELL)
+
+    def test_the_scope_note_still_covers_the_remote_case(self):
+        """The half that was already right, and that the new half reasons from."""
+        self.assertRegex(scope_note_of(self.rendered_apply_patch_scope()), NOTE_REMOTE_IS_THE_ONLY_WAY)
+
+    def test_the_scope_note_says_the_tool_writes_as_one_particular_user(self):
+        """Why a root-owned file is out of reach: not a rule, an ownership fact."""
+        self.assertRegex(
+            scope_note_of(self.rendered_apply_patch_scope()), NOTE_WRITES_AS_THE_SESSION_USER
+        )
+
+    def test_the_scope_note_puts_another_users_file_beside_another_host(self):
+        """The symmetry has to be made in one sentence, not left to the reader."""
+        self.assertRegex(
+            scope_note_of(self.rendered_apply_patch_scope()),
+            NOTE_CANNOT_WRITE_ANOTHER_USERS_FILE,
+        )
+        self.assertRegex(
+            scope_note_of(self.rendered_apply_patch_scope()), NOTE_SAME_REASON_AS_REMOTE
+        )
+
+    def test_the_scope_note_does_not_forbid_an_authorized_privileged_edit(self):
+        self.assertRegex(
+            scope_note_of(self.rendered_apply_patch_scope()), NOTE_SUDO_IS_NOT_FORBIDDEN
+        )
+
+    def test_the_scope_note_calls_its_own_refusal_a_limit_and_not_a_prohibition(self):
+        """An agent read this tool's `PermissionDenied` as a closed door. The
+        note has to say, on the same channel the tool definition travels on,
+        that it is this tool's ceiling and not a decision about the change."""
+        self.assertRegex(
+            scope_note_of(self.rendered_apply_patch_scope()),
+            NOTE_IS_A_LIMIT_NOT_A_PROHIBITION,
+        )
+
+    def test_the_notifier_npm_manifests_agree_on_a_lowercase_package_name(self):
+        """npm rejects any uppercase character in `package.json`'s `name`
+        field, but `PROGRAM_NAME_PATTERN` allows one -- so a `program_name`
+        like `MyTool` must not reach the notifier's manifests verbatim. All
+        three occurrences (one in `package.json`, two in `package-lock.json`)
+        must agree, or `npm ci` fails on the mismatch."""
+        identity = replace(IDENTITY, program_name="MyTool")
+        artifacts = Adapter().own_artifacts(self.layout, ORCHESTRATOR, identity, ())
+        files = only(artifacts, FileArtifact)
+        manifest = next(item for item in files if item.path.name == "package.json")
+        lockfile = next(item for item in files if item.path.name == "package-lock.json")
+
+        expected_name = "mytool-opencode-notifier"
+        self.assertTrue(expected_name.islower())
+
+        manifest_payload = json.loads(manifest.content.decode("utf-8"))
+        self.assertEqual(manifest_payload["name"], expected_name)
+
+        lockfile_payload = json.loads(lockfile.content.decode("utf-8"))
+        self.assertEqual(lockfile_payload["name"], expected_name)
+        self.assertEqual(lockfile_payload["packages"][""]["name"], expected_name)
+
+    def test_no_shipped_asset_still_carries_an_unfilled_placeholder(self):
+        """Derived from the data, never a hand-listed filename: whichever asset
+        ships, none of them may still say `{{...}}` once `own_artifacts` is done."""
+        for item in only(self.artifacts, FileArtifact):
+            self.assertNotIn(b"{{", item.content, item.path)
+
+    def test_every_placeholder_a_bundled_asset_uses_is_one_the_adapter_can_fill(self):
+        """A typo'd `{{...}}` in a bundled `.ts` (or other) asset must fail the
+        suite instead of shipping a broken plugin: every name any bundled asset
+        actually asks for must be inside the closed vocabulary `own_artifacts`
+        answers -- proven against the real source assets, not the rendered
+        (already-filled) output."""
+        from hpl.core import placeholders as placeholders_module
+
+        used: set[str] = set()
+        for group in adapter_module.ASSET_TARGETS:
+            for path, _relative in adapter_module._asset_files(adapter_module.ASSETS / group):
+                try:
+                    text = path.read_bytes().decode("utf-8")
+                except UnicodeDecodeError:
+                    continue
+                used.update(placeholders_module.names_in(text))
+        self.assertTrue(used, "fixture drifted: no bundled asset uses a placeholder any more")
+        self.assertEqual(used, used & placeholders_module.NAMES)
+
+
+@unittest.skipUnless(shutil.which("node"), "node is not on PATH")
+class ApplyPatchScopeHookTest(unittest.TestCase):
+    """The scoping plugin's hook, run for real.
+
+    Everything else about this plugin is asserted against its text. Two facts
+    cannot be: what the model actually receives is the runtime's description
+    with the note concatenated onto it, and the note has to land exactly once
+    however many times the hook fires for the same tool. Reimplementing either
+    in Python would assert this test's own arithmetic rather than the plugin's
+    -- deleting the idempotence guard would leave a Python re-implementation
+    perfectly green. So the rendered plugin is executed by `node`, whose native
+    type stripping runs a `.ts` module with erasable annotations directly, and
+    the hook is driven the way the runtime drives it.
+
+    Running it also pins `scope_note_of` to reality: the reconstruction the
+    text-level tests read is asserted to be, character for character, what the
+    real hook appends.
+    """
+
+    HARNESS = textwrap.dedent(
+        """
+        import plugin from "./plugin.ts"
+
+        const hooks = await plugin({});
+        const hook = hooks["tool.definition"];
+
+        const patch = { description: "RUNTIME DESCRIPTION.", parameters: {} };
+        await hook({ toolID: "apply_patch" }, patch);
+        const once = patch.description;
+        await hook({ toolID: "apply_patch" }, patch);
+        await hook({ toolID: "apply_patch" }, patch);
+        const thrice = patch.description;
+
+        const other = { description: "RUNTIME DESCRIPTION.", parameters: {} };
+        await hook({ toolID: "write" }, other);
+
+        const missing = { parameters: {} };
+        await hook({ toolID: "apply_patch" }, missing);
+
+        // The premise alarm, exercised separately from the append behaviour
+        // above: each scenario gets its own plugin instance, because the
+        // "fires once" flag is scoped to one instance and reusing `hook`
+        // above would prove nothing about a fresh session.
+        function client(toasts) {
+          return { tui: { showToast: async (input) => { toasts.push(input); } } };
+        }
+
+        const holdingToasts = [];
+        const holdingHooks = await plugin({ client: client(holdingToasts) });
+        const holdingHook = holdingHooks["tool.definition"];
+        const holding = { description: "Use the `apply_patch` tool to edit files. Rest of it.", parameters: {} };
+        await holdingHook({ toolID: "apply_patch" }, holding);
+        await holdingHook({ toolID: "apply_patch" }, holding);
+
+        const brokenToasts = [];
+        const brokenHooks = await plugin({ client: client(brokenToasts) });
+        const brokenHook = brokenHooks["tool.definition"];
+        const broken = { description: "RUNTIME DESCRIPTION.", parameters: {} };
+        await brokenHook({ toolID: "apply_patch" }, broken);
+        await brokenHook({ toolID: "apply_patch" }, broken);
+        await brokenHook({ toolID: "apply_patch" }, broken);
+
+        // Overlapping calls, which the sequential scenario above cannot
+        // catch: this toast suspends before it records anything, so a latch
+        // set after the await instead of before it would let a second call
+        // through while the first is still in flight. Two turns resolving
+        // tools at once in the same session hit exactly this, because the
+        // runtime caches one hook closure -- and one flag -- per directory.
+        function slowClient(toasts) {
+          return {
+            tui: {
+              showToast: async (input) => {
+                await new Promise((resolve) => setTimeout(resolve, 5));
+                toasts.push(input);
+              },
+            },
+          };
+        }
+
+        const overlappingToasts = [];
+        const overlappingHooks = await plugin({ client: slowClient(overlappingToasts) });
+        const overlappingHook = overlappingHooks["tool.definition"];
+        const overlapping = { description: "RUNTIME DESCRIPTION.", parameters: {} };
+        await Promise.all([
+          overlappingHook({ toolID: "apply_patch" }, overlapping),
+          overlappingHook({ toolID: "apply_patch" }, overlapping),
+          overlappingHook({ toolID: "apply_patch" }, overlapping),
+        ]);
+        // The alarm is fire-and-forget, so the hook returns before the toast
+        // lands; give every in-flight one time to arrive before counting.
+        await new Promise((resolve) => setTimeout(resolve, 60));
+
+        console.log(JSON.stringify({
+          once, thrice, other: other.description, missing,
+          holdingToasts, brokenToasts, brokenDescription: broken.description,
+          overlappingToasts,
+        }));
+        """
+    )
+
+    @classmethod
+    def setUpClass(cls):
+        layout = Adapter().layout(ENVIRONMENT)
+        artifacts = Adapter().own_artifacts(layout, ORCHESTRATOR, IDENTITY, ())
+        files = {item.path: item for item in only(artifacts, FileArtifact)}
+        cls.source = files[
+            CONFIG / f"plugins/{IDENTITY.program_name}-apply-patch-scope.ts"
+        ].content.decode("utf-8")
+
+        cls._tmp = tempfile.TemporaryDirectory()
+        workdir = Path(cls._tmp.name)
+        (workdir / "plugin.ts").write_text(cls.source, encoding="utf-8")
+        (workdir / "harness.mts").write_text(cls.HARNESS, encoding="utf-8")
+        result = subprocess.run(
+            ["node", "harness.mts"],
+            cwd=workdir,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        lines = [line for line in result.stdout.splitlines() if line.strip()]
+        cls.result = json.loads(lines[-1])
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._tmp.cleanup()
+
+    def test_the_hook_appends_to_the_runtime_description_rather_than_replacing_it(self):
+        """Appending is this plugin's deliberate pattern: it never has to match a
+        sentence the runtime owns and may reword without telling anyone."""
+        self.assertTrue(self.result["once"].startswith("RUNTIME DESCRIPTION."))
+
+    def test_the_note_the_model_receives_starts_its_own_paragraph(self):
+        """The runtime's description ends in a sentence of its own, and this
+        plugin appends to it. With nothing between them the model is handed
+        `...to edit files.Scope of this tool:` -- a correction that begins in
+        the middle of somebody else's sentence, which is the reading failure
+        this plugin exists to prevent in the first place.
+
+        Asserted on the executed hook's output rather than on the source: the
+        note is built out of fragments, so no sentence of it exists as a
+        literal in the file and a source-level check would be asserting that
+        some fragment somewhere ends in a newline -- the proxy, not the fact.
+        """
+        description = self.result["once"]
+        runtime, _, note = description.partition("\n\n")
+        self.assertEqual(
+            runtime,
+            "RUNTIME DESCRIPTION.",
+            "the note does not start after a blank line; the model is handed "
+            f"{description[:64]!r}",
+        )
+        self.assertTrue(
+            note[:1].strip(),
+            f"the note starts with padding instead of its first word: {note[:32]!r}",
+        )
+        self.assertNotIn("\n\n", note, "the note is one paragraph, not several")
+
+    def test_what_the_hook_appends_is_exactly_the_note_the_text_tests_read(self):
+        """Pins `scope_note_of` to the real thing, so the assertions that run
+        without `node` are assertions about the model's actual input."""
+        appended = self.result["once"][len("RUNTIME DESCRIPTION.") :]
+        self.assertEqual(appended, scope_note_of(self.source))
+
+    def test_the_description_the_model_receives_carries_the_whole_scope(self):
+        """The fact, end to end: not that the source contains some words, but
+        that the string handed to the model says what this plugin exists to say."""
+        description = self.result["once"]
+        for pattern in (
+            NOTE_IS_LOCAL_ONLY,
+            NOTE_NOT_A_BAN_ON_THE_SHELL,
+            NOTE_REMOTE_IS_THE_ONLY_WAY,
+            NOTE_WRITES_AS_THE_SESSION_USER,
+            NOTE_CANNOT_WRITE_ANOTHER_USERS_FILE,
+            NOTE_SUDO_IS_NOT_FORBIDDEN,
+            NOTE_SAME_REASON_AS_REMOTE,
+            NOTE_IS_A_LIMIT_NOT_A_PROHIBITION,
+        ):
+            self.assertRegex(description, pattern)
+
+    def test_firing_the_hook_again_appends_nothing(self):
+        """The marker's whole job. The hook can fire more than once for the same
+        tool, and a second paragraph is a visible defect in every tool list."""
+        self.assertEqual(self.result["thrice"], self.result["once"])
+
+    def test_the_note_appears_exactly_once_however_often_the_hook_fires(self):
+        """Stronger than string equality above: equality would also hold if the
+        very first call had appended the note twice."""
+        self.assertEqual(self.result["thrice"].count(scope_note_of(self.source)), 1)
+
+    def test_the_hook_leaves_every_other_tool_alone(self):
+        self.assertEqual(self.result["other"], "RUNTIME DESCRIPTION.")
+
+    def test_a_definition_without_a_description_is_left_untouched(self):
+        """The runtime owns that object; inventing a field on it is not this
+        plugin's business."""
+        self.assertNotIn("description", self.result["missing"])
+
+    def test_the_alarm_stays_silent_when_the_imperative_is_present(self):
+        """The premise still holds -- the exact sentence this plugin exists to
+        correct is still in the description -- so nothing is shown. An alarm
+        that fires when its premise holds is noise, not a signal."""
+        self.assertEqual(self.result["holdingToasts"], [])
+
+    def test_the_alarm_fires_when_the_imperative_is_absent(self):
+        """The premise is gone -- upstream no longer says what this plugin was
+        written to correct -- and that has to become visible somewhere a
+        person actually looks."""
+        self.assertEqual(len(self.result["brokenToasts"]), 1)
+
+    def test_the_alarm_fires_at_most_once_per_session(self):
+        """The hook ran three times for the same broken premise; the alarm is
+        scoped to the session, not the call, so a second and third toast would
+        be exactly the noise this design was chosen to avoid."""
+        self.assertEqual(len(self.result["brokenToasts"]), 1)
+
+    def test_the_alarm_fires_once_even_when_the_calls_overlap(self):
+        """The test above proves the alarm does not repeat across calls that
+        wait for each other. It cannot prove the flag is set BEFORE the hook
+        suspends, because sequential awaits never let two calls interleave --
+        an implementation that latched after `await showToast(...)` would keep
+        it green and still fire once per concurrent call in production.
+
+        This scenario overlaps three calls against a toast that suspends
+        before it records anything, which is the shape the runtime really
+        produces: OpenCode caches one hook closure -- and therefore one flag
+        -- per directory, so two turns resolving tools at once in the same
+        session enter this hook concurrently.
+        """
+        self.assertEqual(len(self.result["overlappingToasts"]), 1)
+
+    def test_the_alarm_names_the_sentence_it_no_longer_finds(self):
+        """A person reading the toast has to be able to check the claim
+        themselves, not just be told something moved."""
+        anchor = IMPERATIVE_ANCHOR_CONST.search(self.source).group(1)
+        toast = self.result["brokenToasts"][0]
+        self.assertIn(anchor, toast["body"]["message"])
+
+    def test_the_alarm_never_replaces_the_scope_note_itself(self):
+        """Notifying about the premise and appending the note are two
+        different jobs; the alarm firing must not change what the model
+        receives."""
+        marker = SCOPE_MARKER_CONST.search(self.source).group(1)
+        self.assertTrue(self.result["brokenDescription"].startswith("RUNTIME DESCRIPTION."))
+        self.assertIn(marker, self.result["brokenDescription"])
+
+
+class MissingAssetGroupTest(unittest.TestCase):
+    """A declared asset group with no matching directory must never pass silently.
+
+    An empty-but-present directory is a different situation: an asset group can
+    legitimately ship with nothing in it, so that case must not raise.
+    """
+
+    def test_a_declared_group_with_no_directory_at_all_is_reported_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "present").mkdir()
+            targets = {"present": PurePosixPath("present"), "absent": PurePosixPath("absent")}
+            self.assertEqual(adapter_module._missing_asset_groups(root, targets), ["absent"])
+
+    def test_an_empty_but_present_directory_is_not_reported_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "empty").mkdir()
+            targets = {"empty": PurePosixPath("empty")}
+            self.assertEqual(adapter_module._missing_asset_groups(root, targets), [])
+
+    def test_a_missing_group_is_refused_with_its_name(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            targets = {"plugins": PurePosixPath("plugins")}
+            with self.assertRaises(adapter_module.MissingAssetGroupError) as raised:
+                adapter_module._check_asset_groups(root, targets)
+            self.assertIn("plugins", str(raised.exception))
+
+    def test_the_shipped_package_itself_has_every_declared_group(self):
+        """The check that runs at import time must already have passed for real."""
+        self.assertEqual(
+            adapter_module._missing_asset_groups(adapter_module.ASSETS, adapter_module.ASSET_TARGETS),
+            [],
+        )
+
+
+class ZipAssetFilesTest(unittest.TestCase):
+    """`own_artifacts` must read its bundled assets from inside a zip archive too.
+
+    `importlib.resources.files` hands back a `zipfile.Path` when the package is
+    read straight out of a zip (built with `zipapp`, for instance) instead of a
+    real `pathlib.Path`. The two share `iterdir`, `is_dir`, `is_file` and
+    `read_bytes`, so `_asset_files` must walk the tree using only those, the
+    same constraint `hpl.core.content` already had to satisfy.
+    """
+
+    def setUp(self):
+        self._directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self._directory.cleanup)
+        archive_path = Path(self._directory.name) / "assets.zip"
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr("plugins/engram.ts", "// plugin\n")
+            archive.writestr("plugins/nested/helper.ts", "// helper\n")
+        self.zip_file = zipfile.ZipFile(archive_path)
+        self.addCleanup(self.zip_file.close)
+        self.zip_root = zipfile.Path(self.zip_file)
+
+    def test_files_nested_inside_a_zip_are_found(self):
+        found = adapter_module._asset_files(self.zip_root / "plugins")
+        relative = sorted(str(item[1]) for item in found)
+        self.assertEqual(relative, ["engram.ts", "nested/helper.ts"])
+
+    def test_content_is_read_from_inside_the_zip(self):
+        found = dict(
+            (str(relative), path.read_bytes())
+            for path, relative in adapter_module._asset_files(self.zip_root / "plugins")
+        )
+        self.assertEqual(found["engram.ts"], b"// plugin\n")
+
+
+class RealZipappShipsTheEngramPluginTest(unittest.TestCase):
+    """The real Engram plugin must resolve from inside a real zipapp build.
+
+    `ZipAssetFilesTest` above proves `_asset_files` can walk a `zipfile.Path`
+    generically, but with a placeholder ("// plugin\\n") standing in for the
+    real file -- it cannot tell a correctly shipped plugin from an accidentally
+    empty one. This test builds the actual `hpl` zipapp from this checkout's
+    own source, loads `hpl.adapters.opencode.adapter` from inside that
+    archive in a subprocess, and reads back the plugin content `own_artifacts`
+    hands out. This project has already shipped assets that resolved fine from
+    a checkout and silently degraded once packaged, so the check only counts if
+    it runs against a real archive, not a synthetic one.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.repo_root = Path(__file__).resolve().parents[1]
+        cls.source = (
+            cls.repo_root
+            / "src/hpl/adapters/opencode/assets/plugins/engram.ts"
+        )
+        tools_dir = cls.repo_root / "tools"
+        if str(tools_dir) not in sys.path:
+            sys.path.insert(0, str(tools_dir))
+        from build_zipapp import build as build_zipapp
+
+        cls._tmp = tempfile.TemporaryDirectory()
+        cls.archive = Path(cls._tmp.name) / "hpl"
+        real_identity = cls.repo_root / "src" / "hpl" / "identity.json"
+        build_zipapp(cls.repo_root / "src" / "hpl", cls.archive, real_identity)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._tmp.cleanup()
+
+    def _plugin_bytes_from_the_archive(self) -> bytes:
+        script = textwrap.dedent(
+            f"""
+            import sys
+            sys.path.insert(0, {str(self.archive)!r})
+            from pathlib import Path
+            from hpl.adapters.opencode.adapter import Adapter
+            from hpl.cli import default_identity
+            from hpl.core.types import Environment
+
+            home = Path("/dev/shm/hpl-zip-probe-home")
+            env = Environment(home=home, data_dir=home / ".local" / "share" / "hpl")
+            adapter = Adapter()
+            layout = adapter.layout(env)
+            artifacts = adapter.own_artifacts(layout, "hpl-orchestrator", default_identity(), ())
+            plugin = next(
+                item for item in artifacts
+                if str(item.path).endswith("plugins/engram.ts")
+            )
+            sys.stdout.buffer.write(plugin.content)
+            """
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", script], capture_output=True, check=True
+        )
+        return result.stdout
+
+    def test_the_plugin_shipped_inside_the_archive_is_byte_identical_to_the_source(self):
+        self.assertEqual(
+            self._plugin_bytes_from_the_archive(),
+            self.source.read_bytes(),
+        )
+
+
+class SkillRegistryContractTest(unittest.TestCase):
+    """The one contract that spans a TypeScript plugin and a Python install plan.
+
+    Nothing else crosses this seam, so nothing else can catch it drifting: the
+    plugin reads a file the installer writes, and neither side imports the other.
+    """
+
+    def setUp(self):
+        self.layout = Adapter().layout(ENVIRONMENT)
+        self.artifacts = Adapter().own_artifacts(self.layout, ORCHESTRATOR, IDENTITY, ())
+        self.files = {item.path: item for item in only(self.artifacts, FileArtifact)}
+
+    def rendered_plugin(self) -> str:
+        """The installed skill-registry plugin's own (placeholder-filled) content.
+
+        Read from the render output rather than the bundled source file: the
+        source spells the contract name as `{{program_name}}-skill-registry.env`,
+        and only the rendered artifact carries this distribution's real one.
+        """
+        path = self.layout.plugins_dir / f"{IDENTITY.program_name}-skill-registry.ts"
+        self.assertIn(path, self.files, "the skill-registry plugin was not installed under its derived name")
+        return self.files[path].content.decode("utf-8")
+
+    def contract_path(self):
+        """The target the plugin reads, taken from the plugin instead of restated."""
+        source = self.rendered_plugin()
+        match = re.search(
+            r'join\(\s*configDirectory\s*,\s*"opencode"\s*,\s*"([^"]+)"\s*\)', source
+        )
+        self.assertIsNotNone(match, "the plugin no longer builds its contract path this way")
+        return self.layout.config_dir / match.group(1)
+
+    def test_the_installer_writes_the_file_the_plugin_reads(self):
+        self.assertIn(self.contract_path(), self.files)
+
+    def test_the_contract_carries_resolved_paths_not_placeholders(self):
+        declared = dict(
+            line.split("=", 1)
+            for line in self.files[self.contract_path()].content.decode("utf-8").splitlines()
+            if "=" in line and not line.lstrip().startswith("#")
+        )
+        self.assertEqual(
+            declared,
+            {
+                "HPL_SKILL_REGISTRY_BIN": str(
+                    self.layout.config_dir / "hpl/skill-registry/hpl-skill-registry"
+                ),
+                "HPL_SKILL_ROOTS": str(self.layout.skills_dir),
+            },
+        )
+
+    def test_every_declared_path_is_an_artifact_this_install_creates(self):
+        binary = self.layout.config_dir / "hpl/skill-registry/hpl-skill-registry"
+        self.assertIn(binary, self.files)
+        self.assertEqual(self.layout.skills_dir, self.layout.config_dir / "skills")
+
+    def test_the_binary_the_plugin_executes_is_installed_executable(self):
+        """A wrapper the plugin hands to execFile is useless at 0644.
+
+        The contract can name the right path and the plugin still fail: the
+        permission travels with the artifact, not with the asset it was read from.
+        """
+        binary = self.files[
+            self.layout.config_dir / "hpl/skill-registry/hpl-skill-registry"
+        ]
+        self.assertTrue(binary.executable, f"executable is {binary.executable}")
+
+    def test_no_placeholder_example_is_shipped_any_more(self):
+        stray = [path for path in self.files if path.name.endswith(".example")]
+        self.assertEqual(stray, [])
+
+
+class ShippedContentRenderTest(unittest.TestCase):
+    """Rendering everything this repository distributes must not collide with itself."""
+
+    @classmethod
+    def setUpClass(cls):
+        adapter, cls.layout = Adapter(), Adapter().layout(ENVIRONMENT)
+        loaded = cls.loaded = content_module.load()
+        orchestrator_name = next(agent.name for agent in loaded.agents if agent.default)
+        cls.artifacts = [
+            *(item for skill in loaded.skills for item in adapter.render_skill(cls.layout, skill)),
+            *(item for agent in loaded.agents for item in adapter.render_agent(cls.layout, agent, mcp=())),
+            *(item for agent in loaded.agents for item in adapter.render_prompt(cls.layout, agent)),
+            *(
+                item
+                for command in loaded.commands
+                for item in adapter.render_command(cls.layout, command, orchestrator_name)
+            ),
+            *(item for mcp in loaded.mcp for item in adapter.render_mcp(cls.layout, mcp)),
+            *adapter.render_system_prompt(cls.layout, loaded.system_prompt, IDENTITY),
+            *adapter.own_artifacts(cls.layout, orchestrator_name, IDENTITY, ()),
+        ]
+
+    def test_no_two_artifacts_claim_the_same_address(self):
+        addresses = [
+            (item.path, getattr(item, "pointer", None))
+            for item in self.artifacts
+            if not (isinstance(item, ConfigKeyArtifact) and item.pointer.endswith("/-"))
+        ]
+        self.assertEqual(len(addresses), len(set(addresses)))
+
+    def test_everything_lands_inside_the_configuration_root(self):
+        for item in self.artifacts:
+            self.assertTrue(item.path.is_relative_to(self.layout.config_dir), item.path)
+
+    def test_the_whole_payload_is_produced(self):
+        self.assertGreater(len(self.artifacts), 70)
+
+    def test_no_shipped_agent_renders_a_tools_map_lacking_the_deny_baseline(self):
+        for agent in self.loaded.agents:
+            value = only(render_module.agent(self.layout, agent), ConfigKeyArtifact)[0].value
+            self.assertIs(value["tools"]["*"], False, agent.name)
+
+    def test_no_shipped_agent_renders_a_permission_block_lacking_the_deny_baseline(self):
+        for agent in self.loaded.agents:
+            value = only(render_module.agent(self.layout, agent), ConfigKeyArtifact)[0].value
+            self.assertEqual(value["permission"]["*"], "deny", agent.name)
+            self.assertEqual(value["permission"]["task"]["*"], "deny", agent.name)
+
+    def test_every_shipped_agent_can_reach_the_skills_hpl_installs_for_it(self):
+        """Each shipped prompt defers its detail to an absolute path under the
+        config directory, and every one of those sits outside the project
+        worktree the agent runs in. An agent that can read but is not allowed
+        out there is one whose own required-loading gate can never open.
+        """
+        for agent in self.loaded.agents:
+            value = only(render_module.agent(self.layout, agent), ConfigKeyArtifact)[0].value
+            rule = value["permission"]["external_directory"]
+            self.assertEqual(rule[f"{self.layout.skills_dir.as_posix()}/*"], "allow", agent.name)
+            for path in (self.layout.settings_file, self.layout.config_dir / "prompts"):
+                self.assertNotIn(f"{path.as_posix()}/*", rule, agent.name)
+
+    def test_every_shipped_agent_that_touches_a_path_is_allowed_out_with_a_deny_floor(self):
+        """Every agent, primary or sub-agent alike, gets `"allow"` for a path
+        outside its worktree -- a deliberate product decision surfaced by
+        upstream issue #39112, where a depth-two sub-agent's `"ask"` never
+        renders in any TUI view and hangs forever (see
+        `test_a_subagents_external_directory_baseline_is_allow_not_ask`
+        in `AgentRenderTest`, and `_permission`'s own docstring). The fixed,
+        small deny floor in `EXTERNAL_DIRECTORY_DENY_FLOOR` must still resolve
+        last for every one of them, since it is the only thing standing
+        between this baseline and a shipped agent reading, say, another
+        person's `~/.ssh`.
+        """
+        readers = [
+            agent
+            for agent in self.loaded.agents
+            if set(render_module.EXTERNAL_DIRECTORY_TOOLS) & {*agent.requires_tools, *agent.optional_tools}
+        ]
+        self.assertTrue(readers, "fixture drifted: no shipped agent touches a path outside the worktree any more")
+        primaries = [agent for agent in readers if agent.mode is AgentMode.PRIMARY]
+        subagents = [agent for agent in readers if agent.mode is AgentMode.SUBAGENT]
+        self.assertTrue(primaries, "fixture drifted: no shipped primary agent touches a path outside the worktree")
+        self.assertTrue(subagents, "fixture drifted: no shipped subagent touches a path outside the worktree")
+        floor_size = len(render_module.EXTERNAL_DIRECTORY_DENY_FLOOR)
+        for agent in readers:
+            value = only(render_module.agent(self.layout, agent), ConfigKeyArtifact)[0].value
+            rule = value["permission"]["external_directory"]
+            self.assertEqual(rule["*"], "allow", agent.name)
+            self.assertEqual(rule[f"{self.layout.skills_dir.as_posix()}/*"], "allow", agent.name)
+            self.assertEqual(value["permission"]["*"], "deny", agent.name)
+            for path in (self.layout.settings_file, self.layout.config_dir / "prompts"):
+                self.assertNotIn(f"{path.as_posix()}/*", rule, agent.name)
+            keys = list(rule)
+            self.assertEqual(
+                keys[-floor_size:],
+                list(render_module.EXTERNAL_DIRECTORY_DENY_FLOOR),
+                f"the deny floor must resolve last for {agent.name}",
+            )
+            for pattern, value_ in render_module.EXTERNAL_DIRECTORY_DENY_FLOOR.items():
+                self.assertEqual(rule[pattern], value_, agent.name)
+
+    def test_no_shipped_agent_that_declares_write_renders_an_orphaned_write_permission(self):
+        """`write` has no permission of its own in the runtime's schema -- an agent
+        declaring it must show up under `edit`, never under a `write` key that
+        the runtime's resolver would simply never look at.
+        """
+        declares_write = [a for a in self.loaded.agents if "write" in (*a.requires_tools, *a.optional_tools)]
+        self.assertTrue(declares_write, "fixture drifted: no shipped agent declares write any more")
+        for agent in declares_write:
+            value = only(render_module.agent(self.layout, agent), ConfigKeyArtifact)[0].value
+            self.assertNotIn("write", value["permission"], agent.name)
+            self.assertEqual(value["permission"]["edit"]["*"], "allow", agent.name)
+
+    def test_the_persona_renders_its_declared_tools_as_a_real_restriction(self):
+        """The voice declares the same reach as the orchestrator, and only this
+        side proves the deny baseline still stands underneath it.
+
+        The map is spelled out rather than derived from the declaration: a test
+        that rebuilt it from `requires_tools` would agree with the renderer by
+        construction and prove nothing. This is also where the rename shows --
+        `ask` reaches the runtime as `question` -- and where `*: False` stays
+        visible, so granting everything the voice needs is still an enumeration
+        and not an open door.
+
+        It used to pin `{read, write, edit, skill, question}` and read "denies
+        everything else, `bash` included". The reconversion made the obligation
+        the axis instead of the toolbox, so what is withheld here is no longer
+        a capability but the option of working in silence -- which a permission
+        map cannot express and the prompt has to carry.
+        """
+        persona = next(a for a in self.loaded.agents if a.name == "king-hpl")
+        value = only(render_module.agent(self.layout, persona), ConfigKeyArtifact)[0].value
+        self.assertEqual(
+            value["tools"],
+            {
+                "*": False,
+                "read": True,
+                "write": True,
+                "edit": True,
+                "bash": True,
+                "grep": True,
+                "glob": True,
+                "skill": True,
+                "question": True,
+                "cbm*": True,
+                "context7*": True,
+                "engram*": True,
+                "jira*": True,
+                "playwright*": True,
+            },
+        )
+
+    def test_the_deny_baseline_leaves_the_skill_inventory_reachable(self):
+        """The baseline denies by omission, and the inventory is the cost.
+
+        `{"*": false}` is not a list of what an agent may not do -- it is
+        everything the runtime offers, minus what this repository thought to
+        name. The runtime only shows an agent the installed skills when it
+        holds the tool, so an agent without it is shipped 39 skills it cannot
+        see, under a system prompt that calls consulting them mandatory. This
+        is the assertion that keeps the vocabulary from silently falling behind
+        the runtime again.
+        """
+        for name in ("hpl-orchestrator", "king-hpl"):
+            with self.subTest(agent=name):
+                agent = next(a for a in self.loaded.agents if a.name == name)
+                value = only(render_module.agent(self.layout, agent), ConfigKeyArtifact)[0].value
+                self.assertIs(value["tools"]["skill"], True)
+                self.assertIs(value["tools"]["question"], True)
+                self.assertEqual(value["permission"]["skill"], "allow")
+                self.assertEqual(value["permission"]["question"], "allow")
+
+    def test_an_executor_is_left_without_the_inventory_or_a_way_to_ask(self):
+        for agent in self.loaded.agents:
+            if agent.mode is not content_module.AgentMode.SUBAGENT:
+                continue
+            with self.subTest(agent=agent.name):
+                value = only(render_module.agent(self.layout, agent), ConfigKeyArtifact)[0].value
+                self.assertNotIn("skill", value["tools"])
+                self.assertNotIn("question", value["tools"])
+
+    def test_every_agent_granted_a_server_with_withheld_tools_denies_exactly_those(self):
+        """A guardian, not a fixture test: whichever server ships with
+        `withheld_tools` set, every agent selection grants to it must carry
+        the matching denies -- this is the property the debt exists to close,
+        proven against the real shipped descriptors and agents rather than a
+        hand-built stand-in for them.
+        """
+        selected = content_module.select_mcp(self.loaded, [server.name for server in self.loaded.mcp])
+        withheld_by_id = {server.name: server.withheld_tools for server in selected.mcp}
+        checked_any = False
+        for agent in selected.agents:
+            expected = tuple(
+                f"{mcp_id}_{tool}"
+                for mcp_id in agent.optional_mcp
+                for tool in withheld_by_id.get(mcp_id, ())
+            )
+            if expected:
+                checked_any = True
+            self.assertEqual(set(agent.denied_mcp_tools), set(expected), agent.name)
+            value = only(render_module.agent(self.layout, agent), ConfigKeyArtifact)[0].value
+            for name in expected:
+                self.assertIs(value["tools"][name], False, f"{agent.name}: {name}")
+                self.assertEqual(value["permission"][name], "deny", f"{agent.name}: {name}")
+        self.assertTrue(checked_any, "fixture drifted: no shipped server withholds any tool")
+
+    def test_the_orchestrator_renders_its_declared_allows_on_top_of_the_deny_baseline(self):
+        orchestrator = next(a for a in self.loaded.agents if a.name == "hpl-orchestrator")
+        value = only(render_module.agent(self.layout, orchestrator), ConfigKeyArtifact)[0].value
+        self.assertEqual(value["permission"]["task"]["*"], "deny")
+        for name in orchestrator.may_delegate_to:
+            self.assertEqual(value["permission"]["task"][name], "allow")
+
+    def test_every_declared_delegator_renders_exactly_its_declared_allows(self):
+        """The mirror of the orchestrator-only check above, generalized to every
+        agent that declares `may_delegate_to` -- `sdd-explore`, `sdd-verify`,
+        `king-hpl` and `hpl-general` each fan out to `hpl-general` now
+        that the delegation criterion replaces the outright prohibition. Both
+        directions matter: a declared target must render `allow`, and a name
+        nobody declared must stay on the `deny` baseline rather than leaking in
+        from another agent's grant.
+        """
+        agents_with_delegation = [
+            agent for agent in self.loaded.agents if agent.may_delegate_to
+        ]
+        # Fixture drift guard: if this ever shrinks to just the orchestrator, the
+        # rest of this test would still pass while checking nothing new.
+        self.assertGreaterEqual(len(agents_with_delegation), 4)
+        for agent in agents_with_delegation:
+            with self.subTest(agent=agent.name):
+                value = only(render_module.agent(self.layout, agent), ConfigKeyArtifact)[0].value
+                self.assertEqual(value["permission"]["task"]["*"], "deny")
+                for name in agent.may_delegate_to:
+                    self.assertEqual(value["permission"]["task"][name], "allow")
+                other_agents = {a.name for a in self.loaded.agents} - set(agent.may_delegate_to)
+                for name in other_agents:
+                    self.assertNotEqual(
+                        value["permission"]["task"].get(name), "allow", (agent.name, name)
+                    )
+
+    def test_playwright_selected_is_granted_only_to_the_intended_agents(self):
+        """`playwright*` must render `True`/`"allow"` for exactly the agents
+        that declare it once Playwright is chosen, with every other agent's
+        deny baseline left untouched.
+        """
+        selected = content_module.select_mcp(self.loaded, ["playwright"])
+        # Derived from the declarations, not spelled out: what is under test is
+        # whether the RENDERER honours the declaration, so taking the expected
+        # set from the declaration is the mirror rather than a tautology -- and
+        # it cannot fall behind the content tree the way a copied list does.
+        intended = {a.name for a in selected.agents if "playwright" in a.optional_mcp}
+        self.assertTrue(intended, "no agent declares playwright: this would pass vacuously")
+        for agent in selected.agents:
+            value = only(render_module.agent(self.layout, agent), ConfigKeyArtifact)[0].value
+            self.assertIs(value["tools"]["*"], False, agent.name)
+            self.assertEqual(value["permission"]["*"], "deny", agent.name)
+            if agent.name in intended:
+                self.assertIs(value["tools"]["playwright*"], True, agent.name)
+                self.assertEqual(value["permission"]["playwright*"], "allow", agent.name)
+            else:
+                self.assertNotIn("playwright*", value["tools"], agent.name)
+                self.assertNotIn("playwright*", value["permission"], agent.name)
+
+
+class BoundMcpRenderTest(unittest.TestCase):
+    """A bound server contributes its contract and nothing else.
+
+    Writing `/mcp/<id>` for a server the user administers would put a second
+    definition beside the one they maintain -- two servers, or one silently
+    replaced. The convention still travels, because the behaviour half is
+    HPL's regardless of who owns the binary.
+    """
+
+    def setUp(self):
+        self.adapter = Adapter()
+        self.layout = self.adapter.layout(ENVIRONMENT)
+        self.server = Mcp(
+            name="cbm",
+            description="Code graph",
+            body="# CBM Convention\n",
+            distribution=Distribution.DOWNLOAD,
+            endpoint="https://example.test/cbm.tar.gz",
+            checksum="sha256:" + "a" * 64,
+            version="0.10.8",
+            archive_executable="cbm",
+            source=PurePosixPath("mcp/cbm.md"),
+        )
+
+    def test_an_unbound_server_still_gets_its_settings_key(self):
+        artifacts = render_module.mcp(self.layout, self.server)
+        key = only(artifacts, ConfigKeyArtifact)[0]
+        self.assertEqual(key.pointer, "/mcp/cbm")
+
+    def test_a_bound_server_gets_no_settings_key_at_all(self):
+        bound = replace(self.server, bound_to="codebase-memory-mcp")
+        self.assertEqual(only(render_module.mcp(self.layout, bound), ConfigKeyArtifact), [])
+
+    def test_a_bound_server_still_ships_its_convention(self):
+        bound = replace(self.server, bound_to="codebase-memory-mcp")
+        artifact = only(render_module.mcp(self.layout, bound), FileArtifact)[0]
+        self.assertEqual(artifact.id, "mcp-convention:cbm")
+        self.assertEqual(
+            artifact.path, CONFIG / "skills" / "_shared" / "mcp" / "cbm-convention.md"
+        )
+
+    def test_the_convention_is_named_by_the_id_not_by_the_binding(self):
+        """An agent body references `_shared/mcp/cbm-convention.md`, which is
+        derived from the id. Naming the file after the binding would break that
+        reference for exactly the installations this feature exists to serve.
+        """
+        bound = replace(self.server, bound_to="codebase-memory-mcp")
+        artifact = only(render_module.mcp(self.layout, bound), FileArtifact)[0]
+        self.assertNotIn("codebase-memory-mcp", artifact.path.name)
+
+    def test_a_bound_server_needs_no_dependencies_directory(self):
+        """The download path resolves an address for a fetched binary. A bound
+        server is never fetched, so a layout with no dependencies directory --
+        the shape a catalog build uses -- must not fail on its account.
+        """
+        bare = replace(self.layout, dependencies_dir=None)
+        bound = replace(self.server, bound_to="codebase-memory-mcp")
+        artifacts = render_module.mcp(bare, bound)
+        self.assertEqual(len(only(artifacts, FileArtifact)), 1)
+        with self.assertRaises(render_module.RenderError):
+            render_module.mcp(bare, self.server)
+
+
+class PlaceholderRenderTest(unittest.TestCase):
+    """The adapter answers what the body could not know.
+
+    A body ships one text to every CLI, so it names a fact and this adapter turns
+    it into its own path. An adapter whose layout has no such concept must say so
+    rather than write a blank into an agent's loading gate.
+    """
+
+    def setUp(self):
+        self.adapter = Adapter()
+        self.layout = self.adapter.layout(ENVIRONMENT)
+        self.skills = str(CONFIG / "skills")
+
+    def test_a_prompt_file_gets_the_installed_skills_root(self):
+        agent = Agent(
+            name="sdd-apply",
+            description="Implementation executor",
+            body="Read {{skills_root}}/sdd-apply/SKILL.md first.\n",
+            mode=AgentMode.SUBAGENT,
+            source=PurePosixPath("agents/sdd-apply.md"),
+        )
+        content = self.adapter.render_prompt(self.layout, agent)[0].content.decode("utf-8")
+        self.assertIn(f"{self.skills}/sdd-apply/SKILL.md", content)
+        self.assertNotIn("{{", content)
+
+    def test_an_inlined_agent_body_gets_it_too(self):
+        agent = Agent(
+            name="sdd-apply",
+            description="Implementation executor",
+            body="Read {{skills_root}}/sdd-apply/SKILL.md first.\n",
+            mode=AgentMode.SUBAGENT,
+            source=PurePosixPath("agents/sdd-apply.md"),
+        )
+        value = render_module.agent(self.layout, agent, separate_prompt=False)[0].value
+        self.assertIn(self.skills, value["prompt"])
+
+    def test_a_command_body_gets_it(self):
+        item = Command(
+            name="sdd-apply",
+            description="Implement tasks",
+            body="Load {{skills_root}}/sdd-apply/SKILL.md.\n",
+            runs_as=RunsAs.BUILDER,
+            execution=Execution.ISOLATED,
+            source=PurePosixPath("commands/sdd-apply.md"),
+        )
+        content = self.adapter.render_command(self.layout, item, "hpl-orchestrator")[0].content.decode("utf-8")
+        self.assertIn(self.skills, content)
+
+    def test_a_system_prompt_body_gets_it(self):
+        item = SystemPrompt(
+            body="Skills live in {{skills_root}}.\n",
+            source=PurePosixPath("system-prompt/AGENTS.md"),
+        )
+        artifact = only(self.adapter.render_system_prompt(self.layout, item, IDENTITY), FileArtifact)[0]
+        self.assertIn(self.skills, artifact.content.decode("utf-8"))
+
+    def test_a_layout_without_skills_refuses_instead_of_writing_a_blank(self):
+        layout = Layout(config_dir=CONFIG, prompts_dir=CONFIG / "prompts")
+        agent = Agent(
+            name="sdd-apply",
+            description="Implementation executor",
+            body="Read {{skills_root}}/sdd-apply/SKILL.md first.\n",
+            mode=AgentMode.SUBAGENT,
+            source=PurePosixPath("agents/sdd-apply.md"),
+        )
+        with self.assertRaises(render_module.RenderError) as raised:
+            render_module.prompt(layout, agent)
+        self.assertIn("skills_root", str(raised.exception))
+
+    def test_a_body_with_nothing_to_fill_is_untouched(self):
+        agent = Agent(
+            name="sdd-verify",
+            description="Readiness authority",
+            body="# Verify\n\nProve it.\n",
+            mode=AgentMode.SUBAGENT,
+            source=PurePosixPath("agents/sdd-verify.md"),
+        )
+        content = self.adapter.render_prompt(self.layout, agent)[0].content.decode("utf-8")
+        self.assertEqual(content, "# Verify\n\nProve it.\n")
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+class DeclaredProgramsMatchTheTreeTest(unittest.TestCase):
+    """The executable bit is declared, and this is what keeps the declaration true.
+
+    It has to be declared: inside an archive the bit cannot be read at all, so
+    asking the file would answer one way from a checkout and another way from a
+    zip, and nothing would say they disagreed.
+
+    But a declaration drifts. An asset added with its executable bit set and not
+    named here would ship as plain text, and the failure lands far away — a
+    program someone's plugin cannot run. So the set is held to what this
+    package's own tree really carries, on disk, which is the one place the
+    question can still be asked directly.
+    """
+
+    def executables_on_disk(self) -> set[str]:
+        root = Path(adapter_module.__file__).resolve().parent / "assets"
+        return {
+            path.name
+            for path in root.rglob("*")
+            if path.is_file() and path.stat().st_mode & 0o111 and "__pycache__" not in path.parts
+        }
+
+    def test_every_asset_that_is_executable_on_disk_is_declared(self):
+        undeclared = self.executables_on_disk() - set(adapter_module.EXECUTABLE_ASSETS)
+        self.assertEqual(
+            sorted(undeclared), [], "executable assets that would ship without their bit"
+        )
+
+    def test_nothing_is_declared_that_is_not_executable_on_disk(self):
+        """The other direction: a name left behind after its file stopped being
+        a program would quietly hand out a bit nothing needs."""
+        stale = set(adapter_module.EXECUTABLE_ASSETS) - self.executables_on_disk()
+        self.assertEqual(sorted(stale), [], "declared programs that are not executable in the tree")

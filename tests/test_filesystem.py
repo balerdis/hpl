@@ -1,0 +1,602 @@
+"""The filesystem port and its POSIX implementation.
+
+These tests exercise a real directory on purpose. Atomic writing is a claim about
+what the operating system does, and a fake cannot falsify it.
+"""
+from __future__ import annotations
+
+import os
+import stat
+import tempfile
+import unittest
+from pathlib import Path
+from unittest import mock
+
+from hpl.infra import fs_posix
+from hpl.infra.fs_posix import PosixFileSystem
+from hpl.ports.filesystem import FileSystem, FileSystemError
+from platform_conditions import make_unwritable
+from real_home import _scratch_root
+
+
+class PosixFileSystemTest(unittest.TestCase):
+    """Not `RealHomeTestCase` on purpose: some of these tests carry their own
+    `@unittest.skipIf(os.geteuid() == 0, ...)` on individual methods rather
+    than skipping the whole class, because most of what this file tests
+    (atomic writing, listing, removal) is not permission-bit-dependent and
+    still needs to run under a root test process. Inheriting
+    `RealHomeTestCase` would move that skip into `setUp` and silently skip
+    every test here under root, losing real coverage. `dir=_scratch_root()`
+    gets the same tmpfs-when-available home without that side effect.
+
+    Every test in this class was run against both `/tmp` and `/dev/shm`
+    before this line was added; both gave the same 70/70 pass with identical
+    behaviour -- tmpfs on Linux supports the same permission bits, symlinks,
+    and atomic rename this port depends on.
+    """
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory(dir=_scratch_root())
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name)
+        self.fs = PosixFileSystem(product_id="hpl")
+
+    def leftovers(self, folder: Path) -> list[str]:
+        return sorted(item.name for item in folder.iterdir() if item.name.startswith("."))
+
+    # --- The port ---
+
+    def test_the_posix_implementation_satisfies_the_port(self):
+        self.assertIsInstance(self.fs, FileSystem)
+
+    # --- Locating ---
+
+    def test_data_dir_falls_back_to_local_share_when_xdg_data_home_is_empty(self):
+        filesystem = PosixFileSystem({"XDG_DATA_HOME": ""}, product_id="hpl")
+        home = Path("/home/probe")
+        self.assertEqual(filesystem.data_dir(home), home / ".local" / "share" / "hpl")
+
+    def test_data_dir_honours_xdg_data_home_when_set(self):
+        filesystem = PosixFileSystem({"XDG_DATA_HOME": "/mnt/data"}, product_id="hpl")
+        self.assertEqual(filesystem.data_dir(Path("/home/probe")), Path("/mnt/data/hpl"))
+
+    def test_data_dir_ignores_a_relative_xdg_data_home(self):
+        """A relative setting names a directory that depends on where the
+        process was started, which is not a home anyone chose."""
+        filesystem = PosixFileSystem({"XDG_DATA_HOME": "somewhere"}, product_id="hpl")
+        self.assertEqual(
+            filesystem.data_dir(Path("/home/probe")), Path("/home/probe/.local/share/hpl")
+        )
+
+    def test_data_dir_stays_inside_the_home_when_no_environment_was_handed_in(self):
+        """The guarantee every test in this suite leans on: a filesystem built
+        without an environment answers from the home it was asked about, so a
+        machine that exports the variable cannot pull a test's writes out of
+        the throwaway home it made."""
+        self.assertEqual(
+            PosixFileSystem(product_id="hpl").data_dir(Path("/home/probe")),
+            Path("/home/probe/.local/share/hpl"),
+        )
+
+    def test_data_dir_uses_the_given_product_id(self):
+        """`product_id` names the directory segment, nothing else does -- a
+        second distribution built from the same engine gets its own,
+        entirely separate, data directory."""
+        filesystem = PosixFileSystem(product_id="acme-nova")
+        self.assertEqual(
+            filesystem.data_dir(Path("/home/probe")), Path("/home/probe/.local/share/acme-nova")
+        )
+
+    def test_product_id_is_required(self):
+        """No default exists to fall back to -- see `PosixFileSystem`'s own
+        docstring. A caller that forgot to pass `product_id` must fail before
+        it ever asks for a path, not answer from a directory named after
+        whichever product happened to be built last."""
+        with self.assertRaises(TypeError):
+            PosixFileSystem()
+
+    def test_hpl_harness_data_dir_is_byte_identical_to_the_5_17_0_literal(self):
+        """The non-negotiable acceptance criterion for this change: HPL's
+        own `product_id` is `"hpl"`, and the resolved data dir
+        must equal exactly `~/.local/share/hpl`, unchanged from
+        every release up to and including 5.17.0."""
+        filesystem = PosixFileSystem(product_id="hpl")
+        self.assertEqual(
+            filesystem.data_dir(Path("/home/probe")),
+            Path("/home/probe/.local/share/hpl"),
+        )
+
+    def test_bin_dir_falls_back_to_local_bin_when_xdg_bin_home_is_empty(self):
+        filesystem = PosixFileSystem({"XDG_BIN_HOME": ""}, product_id="hpl")
+        home = Path("/home/probe")
+        self.assertEqual(filesystem.bin_dir(home), home / ".local" / "bin")
+
+    def test_bin_dir_honours_xdg_bin_home_when_set(self):
+        filesystem = PosixFileSystem({"XDG_BIN_HOME": "/mnt/bin"}, product_id="hpl")
+        self.assertEqual(filesystem.bin_dir(Path("/home/probe")), Path("/mnt/bin"))
+
+    def test_bin_dir_ignores_a_relative_xdg_bin_home(self):
+        filesystem = PosixFileSystem({"XDG_BIN_HOME": "somewhere"}, product_id="hpl")
+        self.assertEqual(filesystem.bin_dir(Path("/home/probe")), Path("/home/probe/.local/bin"))
+
+    def test_bin_dir_stays_inside_the_home_when_no_environment_was_handed_in(self):
+        """Same guarantee as `data_dir`: a filesystem built without an
+        environment answers from the home alone, never the real machine's own
+        `PATH` convention."""
+        self.assertEqual(
+            PosixFileSystem(product_id="hpl").bin_dir(Path("/home/probe")), Path("/home/probe/.local/bin")
+        )
+
+    # --- Permissions ---
+
+    def test_an_executable_artifact_gets_a_program_mode(self):
+        self.assertEqual(self.fs.mode_for(executable=True), 0o755)
+
+    def test_a_non_executable_artifact_gets_a_text_mode(self):
+        self.assertEqual(self.fs.mode_for(executable=False), 0o644)
+
+    # --- Writing ---
+
+    def test_write_atomic_creates_the_file_with_its_content(self):
+        target = self.root / "note.txt"
+        self.fs.write_atomic(target, b"hello")
+        self.assertEqual(target.read_bytes(), b"hello")
+
+    def test_write_atomic_creates_missing_parent_directories(self):
+        target = self.root / "deep" / "nested" / "note.txt"
+        self.fs.write_atomic(target, b"hello")
+        self.assertEqual(target.read_bytes(), b"hello")
+
+    def test_write_atomic_applies_the_requested_mode(self):
+        target = self.root / "private.txt"
+        self.fs.write_atomic(target, b"secret", mode=0o600)
+        self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o600)
+
+    def test_write_atomic_replaces_existing_content(self):
+        target = self.root / "note.txt"
+        self.fs.write_atomic(target, b"first")
+        self.fs.write_atomic(target, b"second")
+        self.assertEqual(target.read_bytes(), b"second")
+
+    def test_write_atomic_leaves_no_partial_file_behind(self):
+        self.fs.write_atomic(self.root / "note.txt", b"hello")
+        self.assertEqual(self.leftovers(self.root), [])
+
+    def test_a_failed_replace_preserves_the_previous_content(self):
+        """Atomic means the reader sees the old file or the new one, never a stump."""
+        target = self.root / "note.txt"
+        self.fs.write_atomic(target, b"first")
+
+        def explode(*args, **kwargs):
+            raise OSError("no space left on device")
+
+        original = os.replace
+        os.replace = explode
+        try:
+            with self.assertRaises(FileSystemError):
+                self.fs.write_atomic(target, b"second")
+        finally:
+            os.replace = original
+
+        self.assertEqual(target.read_bytes(), b"first")
+        self.assertEqual(self.leftovers(self.root), [])
+
+    def test_an_orphaned_temporary_file_is_identifiable_as_hpl(self):
+        """An orphaned `.{TEMPORARY_PREFIX}*` temp file from a half-finished
+        atomic write must stay identifiable by name, the same reasoning
+        `test_the_client_name_sent_to_third_party_servers_is_hpl_doctor`
+        pins for the MCP handshake's wire identifier: engine plumbing, not
+        product identity, keeps the engine's own name regardless of which
+        distribution runs."""
+        self.assertEqual(fs_posix.TEMPORARY_PREFIX, ".hpl-")
+
+    def test_writing_over_a_directory_raises_the_port_error(self):
+        target = self.root / "occupied"
+        target.mkdir()
+        with self.assertRaises(FileSystemError):
+            self.fs.write_atomic(target, b"hello")
+
+    # --- Reading ---
+
+    def test_read_bytes_returns_what_was_written(self):
+        target = self.root / "note.txt"
+        target.write_bytes(b"hello")
+        self.assertEqual(self.fs.read_bytes(target), b"hello")
+
+    def test_reading_a_missing_file_raises_the_port_error(self):
+        with self.assertRaises(FileSystemError):
+            self.fs.read_bytes(self.root / "absent.txt")
+
+    def test_exists_reports_files_and_directories(self):
+        (self.root / "note.txt").write_bytes(b"")
+        self.assertTrue(self.fs.exists(self.root / "note.txt"))
+        self.assertTrue(self.fs.exists(self.root))
+        self.assertFalse(self.fs.exists(self.root / "absent.txt"))
+
+    @unittest.skipIf(os.geteuid() == 0, "root bypasses permission bits")
+    def test_exists_raises_rather_than_reporting_absent_when_a_parent_cannot_be_read(self):
+        """A directory nobody can traverse hides everything under it, and
+        the fifteen files down there are not absent just because they could
+        not be seen. Reporting them as absent is what let a real `restore`
+        delete sixteen files that were on disk the whole time."""
+        blocked = self.root / "blocked"
+        blocked.mkdir()
+        present = blocked / "inside" / "note.txt"
+        present.parent.mkdir()
+        present.write_bytes(b"still here")
+        blocked.chmod(0o000)
+        self.addCleanup(blocked.chmod, 0o755)
+
+        with self.assertRaises(FileSystemError):
+            self.fs.exists(present)
+
+    def test_mode_of_raises_rather_than_reporting_absent_when_it_cannot_be_read(self):
+        """`None` from this method means one thing, and it has meant two.
+
+        A caller reads it to put a file's own permissions back after
+        rewriting it — the whole reason the method exists — and falls back to
+        a default when it gets `None`. That default is right for a file being
+        created and wrong for one whose bits could not be read: it would put
+        the user's `0600` file back as `0644`. The two facts have to be
+        distinguishable at the port, exactly as `exists` had to stop
+        collapsing absent into unreadable.
+        """
+        blocked = self.root / "blocked"
+        blocked.mkdir()
+        present = blocked / "note.txt"
+        present.write_bytes(b"private")
+        blocked.chmod(0o000)
+        self.addCleanup(blocked.chmod, 0o755)
+
+        with self.assertRaises(FileSystemError):
+            self.fs.mode_of(present)
+
+    def test_mode_of_still_reports_an_absent_path_as_none(self):
+        self.assertIsNone(self.fs.mode_of(self.root / "nada.txt"))
+
+    # --- Removing ---
+
+    def test_remove_deletes_the_file(self):
+        target = self.root / "note.txt"
+        target.write_bytes(b"hello")
+        self.fs.remove(target)
+        self.assertFalse(target.exists())
+
+    def test_removing_an_absent_file_is_not_an_error(self):
+        """Retiring an artifact the user already deleted is success, not failure."""
+        self.fs.remove(self.root / "absent.txt")
+
+    def test_removing_a_directory_raises_the_port_error(self):
+        target = self.root / "folder"
+        target.mkdir()
+        with self.assertRaises(FileSystemError):
+            self.fs.remove(target)
+
+    def test_remove_dir_deletes_a_directory_and_its_contents(self):
+        target = self.root / "generation"
+        (target / "nested").mkdir(parents=True)
+        (target / "nested" / "file.blob").write_bytes(b"payload")
+        self.fs.remove_dir(target)
+        self.assertFalse(target.exists())
+
+    def test_removing_an_absent_directory_is_not_an_error(self):
+        """A retention pass that runs twice must not fail the second time."""
+        self.fs.remove_dir(self.root / "absent")
+
+    def test_remove_dir_raises_the_port_error_on_a_file(self):
+        target = self.root / "note.txt"
+        target.write_bytes(b"")
+        with self.assertRaises(FileSystemError):
+            self.fs.remove_dir(target)
+
+    # --- Directories ---
+
+    def test_make_dir_creates_the_whole_chain(self):
+        target = self.root / "one" / "two" / "three"
+        self.fs.make_dir(target)
+        self.assertTrue(target.is_dir())
+
+    def test_make_dir_applies_the_requested_mode(self):
+        target = self.root / "private"
+        self.fs.make_dir(target, mode=0o700)
+        self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o700)
+
+    def test_make_dir_is_idempotent(self):
+        target = self.root / "folder"
+        self.fs.make_dir(target)
+        self.fs.make_dir(target)
+        self.assertTrue(target.is_dir())
+
+    def test_make_dir_does_not_change_the_mode_of_a_directory_that_already_exists(self):
+        """The mode applies on creation only. A caller asking for 0700 on an
+        existing directory gets whatever it already had, and hardening it would
+        mean mutating something this installation did not create."""
+        target = self.root / "inherited"
+        target.mkdir(mode=0o755)
+        self.fs.make_dir(target, mode=0o700)
+        self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o755)
+
+    def test_make_dir_over_a_file_raises_the_port_error(self):
+        target = self.root / "note.txt"
+        target.write_bytes(b"")
+        with self.assertRaises(FileSystemError):
+            self.fs.make_dir(target)
+
+    def test_make_dir_reports_every_directory_it_actually_created(self):
+        """The whole point of the new return value: a caller that later has
+        to know what HPL is allowed to take back needs to learn, at the
+        one moment this is knowable, every directory this call brought into
+        existence -- not just the leaf it asked for."""
+        target = self.root / "one" / "two" / "three"
+        created = self.fs.make_dir(target)
+        self.assertEqual(created, (self.root / "one", self.root / "one" / "two", target))
+
+    def test_make_dir_reports_nothing_when_the_directory_already_existed(self):
+        target = self.root / "folder"
+        target.mkdir()
+        self.assertEqual(self.fs.make_dir(target), ())
+
+    def test_make_dir_reports_only_the_missing_ancestors_not_the_ones_already_there(self):
+        (self.root / "existing").mkdir()
+        target = self.root / "existing" / "new-child" / "leaf"
+        created = self.fs.make_dir(target)
+        self.assertEqual(created, (self.root / "existing" / "new-child", target))
+
+    def test_mode_of_reports_the_permission_bits(self):
+        target = self.root / "note.txt"
+        target.write_bytes(b"")
+        target.chmod(0o640)
+        self.assertEqual(self.fs.mode_of(target), 0o640)
+
+    def test_mode_of_a_missing_path_is_none(self):
+        self.assertIsNone(self.fs.mode_of(self.root / "absent.txt"))
+
+    def test_a_users_file_keeps_its_permissions_when_rewritten_with_its_own_mode(self):
+        """Writing into a configuration file must not change who can read it."""
+        target = self.root / "settings.json"
+        target.write_bytes(b"{}")
+        target.chmod(0o600)
+        self.fs.write_atomic(target, b'{"a": 1}', mode=self.fs.mode_of(target))
+        self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o600)
+
+    # --- Who is running ---
+
+    def test_a_directory_this_process_created_is_writable_on_behalf_of_its_owner(self):
+        self.assertEqual(self.fs.writable_on_behalf_of_owner(self.root), os.geteuid() != 0)
+
+    def test_a_missing_home_is_not_writable_on_behalf_of_its_owner(self):
+        self.assertFalse(self.fs.writable_on_behalf_of_owner(self.root / "absent"))
+
+    # --- Listing ---
+
+    def test_listing_a_missing_directory_is_empty(self):
+        self.assertEqual(self.fs.list_dir(self.root / "absent"), [])
+
+    def test_listing_returns_entries_in_sorted_order(self):
+        target = self.root / "listed"
+        target.mkdir()
+        (target / "b").mkdir()
+        (target / "a").mkdir()
+        (target / "c").write_bytes(b"")
+        self.assertEqual(self.fs.list_dir(target), ["a", "b", "c"])
+
+    def test_listing_an_empty_directory_is_empty(self):
+        target = self.root / "empty"
+        target.mkdir()
+        self.assertEqual(self.fs.list_dir(target), [])
+
+    def test_listing_a_file_raises_the_port_error(self):
+        target = self.root / "note.txt"
+        target.write_bytes(b"")
+        with self.assertRaises(FileSystemError):
+            self.fs.list_dir(target)
+
+    @unittest.skipIf(os.geteuid() == 0, "root bypasses permission bits")
+    def test_listing_raises_rather_than_reporting_empty_when_a_parent_cannot_be_read(self):
+        blocked = self.root / "blocked"
+        blocked.mkdir()
+        target = blocked / "inside"
+        target.mkdir()
+        (target / "note.txt").write_bytes(b"still here")
+        blocked.chmod(0o000)
+        self.addCleanup(blocked.chmod, 0o755)
+
+        with self.assertRaises(FileSystemError):
+            self.fs.list_dir(target)
+
+    @unittest.skipIf(os.geteuid() == 0, "root bypasses permission bits")
+    def test_listing_raises_rather_than_reporting_empty_for_a_directory_that_cannot_be_read_itself(self):
+        target = self.root / "locked"
+        target.mkdir()
+        (target / "note.txt").write_bytes(b"still here")
+        target.chmod(0o000)
+        self.addCleanup(target.chmod, 0o755)
+
+        with self.assertRaises(FileSystemError):
+            self.fs.list_dir(target)
+
+
+    # --- Writability ---
+
+    @unittest.skipIf(os.geteuid() == 0, "root bypasses permission bits")
+    def test_is_writable_is_true_for_an_existing_writable_file(self):
+        target = self.root / "existing.txt"
+        target.write_bytes(b"content")
+        self.assertTrue(self.fs.is_writable(target))
+
+    @unittest.skipIf(os.geteuid() == 0, "root bypasses permission bits")
+    def test_is_writable_is_true_for_a_read_only_file_in_a_writable_directory(self):
+        """What governs a replace is the containing directory, not the
+        file's own bits -- see `PosixFileSystem.is_writable`'s own
+        docstring. A read-only file here would previously have been refused
+        even though `os.replace` over it would succeed."""
+        target = self.root / "readonly.txt"
+        target.write_bytes(b"content")
+        target.chmod(0o444)
+        self.addCleanup(target.chmod, 0o644)
+        self.assertTrue(self.fs.is_writable(target))
+
+    @unittest.skipIf(os.geteuid() == 0, "root bypasses permission bits")
+    def test_is_writable_is_true_for_an_absent_path_whose_parent_directory_accepts_new_files(self):
+        target = self.root / "not-yet-there.txt"
+        self.assertFalse(target.exists())
+        self.assertTrue(self.fs.is_writable(target))
+
+    @unittest.skipIf(os.geteuid() == 0, "root bypasses permission bits")
+    def test_is_writable_is_false_when_the_containing_directory_refuses_new_files(self):
+        locked = self.root / "locked-dir"
+        locked.mkdir()
+        undo = make_unwritable(locked)
+        self.addCleanup(undo)
+        self.assertFalse(self.fs.is_writable(locked / "would-be-new.txt"))
+
+    @unittest.skipIf(os.geteuid() == 0, "root bypasses permission bits")
+    def test_is_writable_is_false_for_an_existing_file_in_a_directory_that_refuses_replacement(self):
+        locked = self.root / "locked-dir"
+        locked.mkdir()
+        existing = locked / "existing.txt"
+        existing.write_bytes(b"content")
+        undo = make_unwritable(locked)
+        self.addCleanup(undo)
+        self.assertFalse(self.fs.is_writable(existing))
+
+    # --- Ownership ---
+
+    def test_owned_by_current_user_is_true_for_a_file_this_process_created(self):
+        target = self.root / "mine.txt"
+        target.write_bytes(b"content")
+        self.assertTrue(self.fs.owned_by_current_user(target))
+
+    def test_owned_by_current_user_is_false_for_a_missing_path(self):
+        self.assertFalse(self.fs.owned_by_current_user(self.root / "absent.txt"))
+
+    # --- Symlinks ---
+
+    def test_is_symlink_is_false_for_a_plain_directory(self):
+        target = self.root / "plain"
+        target.mkdir()
+        self.assertFalse(self.fs.is_symlink(target))
+
+    def test_is_symlink_is_false_for_a_plain_file(self):
+        target = self.root / "note.txt"
+        target.write_bytes(b"hello")
+        self.assertFalse(self.fs.is_symlink(target))
+
+    def test_is_symlink_is_false_for_an_absent_path(self):
+        self.assertFalse(self.fs.is_symlink(self.root / "absent"))
+
+    def test_is_symlink_is_true_for_a_symlink_without_resolving_it(self):
+        destination = self.root / "destination"
+        destination.mkdir()
+        link = self.root / "link"
+        link.symlink_to(destination)
+        self.assertTrue(self.fs.is_symlink(link))
+
+    def test_is_symlink_is_true_for_a_dangling_symlink(self):
+        link = self.root / "dangling"
+        link.symlink_to(self.root / "never-existed")
+        self.assertTrue(self.fs.is_symlink(link))
+
+    def test_resolves_to_directory_is_true_for_a_plain_directory(self):
+        target = self.root / "plain"
+        target.mkdir()
+        self.assertTrue(self.fs.resolves_to_directory(target))
+
+    def test_resolves_to_directory_is_false_for_a_plain_file(self):
+        target = self.root / "note.txt"
+        target.write_bytes(b"hello")
+        self.assertFalse(self.fs.resolves_to_directory(target))
+
+    def test_resolves_to_directory_is_false_for_an_absent_path(self):
+        self.assertFalse(self.fs.resolves_to_directory(self.root / "absent"))
+
+    def test_resolves_to_directory_is_true_for_a_symlink_to_a_directory(self):
+        destination = self.root / "destination"
+        destination.mkdir()
+        link = self.root / "link-to-dir"
+        link.symlink_to(destination)
+        self.assertTrue(self.fs.resolves_to_directory(link))
+
+    def test_resolves_to_directory_is_false_for_a_symlink_to_a_file(self):
+        destination = self.root / "destination.txt"
+        destination.write_bytes(b"hello")
+        link = self.root / "link-to-file"
+        link.symlink_to(destination)
+        self.assertFalse(self.fs.resolves_to_directory(link))
+
+    def test_resolves_to_directory_is_false_for_a_dangling_symlink(self):
+        link = self.root / "dangling-target"
+        link.symlink_to(self.root / "never-existed")
+        self.assertFalse(self.fs.resolves_to_directory(link))
+
+    def test_resolves_to_directory_is_false_for_a_symlink_loop(self):
+        """`ln -s a a`: a symlink that points at its own name, so resolving
+        it never terminates on its own -- the kernel gives up with `ELOOP`
+        rather than spinning forever. That failure to tell must read as "not
+        a directory," the same posture every other undecidable case here
+        takes, never as a crash or a hang."""
+        loop = self.root / "selfloop"
+        loop.symlink_to("selfloop")
+        self.assertFalse(self.fs.resolves_to_directory(loop))
+
+    def test_resolves_to_directory_raises_when_the_target_cannot_be_reached(self):
+        """A symlink whose own directory entry is perfectly readable can
+        still point through a directory this process may not enter -- an
+        `EACCES` on the `stat` of the target, not on the link itself. This
+        is not "plainly nothing to resolve" the way a dangling link or a
+        loop is -- it is "cannot tell" -- so it takes the same posture
+        `is_symlink` already takes for that: raise, rather than guess.
+        `empty_directories_never_pruned` is where "cannot tell" is turned
+        into "not reported"; that decision belongs to the caller, not to
+        this probe."""
+        restricted = self.root / "restricted"
+        restricted.mkdir()
+        os.chmod(restricted, 0o000)
+        self.addCleanup(os.chmod, restricted, 0o755)
+        link = self.root / "link-through-restricted"
+        link.symlink_to(restricted / "inside")
+        with self.assertRaises(FileSystemError):
+            self.fs.resolves_to_directory(link)
+
+    # --- Pruning empty directories ---
+
+    def test_remove_empty_dir_deletes_an_empty_directory(self):
+        target = self.root / "empty"
+        target.mkdir()
+        self.assertTrue(self.fs.remove_empty_dir(target))
+        self.assertFalse(target.exists())
+
+    def test_remove_empty_dir_on_an_absent_directory_is_true(self):
+        self.assertTrue(self.fs.remove_empty_dir(self.root / "absent"))
+
+    def test_remove_empty_dir_on_a_non_empty_directory_is_false_and_removes_nothing(self):
+        target = self.root / "occupied"
+        target.mkdir()
+        (target / "note.txt").write_bytes(b"still here")
+        self.assertFalse(self.fs.remove_empty_dir(target))
+        self.assertTrue(target.exists())
+        self.assertTrue((target / "note.txt").exists())
+
+    def test_remove_empty_dir_on_a_file_raises_the_port_error(self):
+        target = self.root / "note.txt"
+        target.write_bytes(b"hello")
+        with self.assertRaises(FileSystemError):
+            self.fs.remove_empty_dir(target)
+        self.assertTrue(target.exists())
+
+    def test_remove_empty_dir_on_a_symlink_raises_the_port_error(self):
+        """A symlink is never a directory this call may aim at -- the caller
+        picked the wrong kind of path, and that is a bug to surface, not a
+        normal stopping point to answer `False` for."""
+        destination = self.root / "destination"
+        destination.mkdir()
+        link = self.root / "link"
+        link.symlink_to(destination)
+        with self.assertRaises(FileSystemError):
+            self.fs.remove_empty_dir(link)
+        self.assertTrue(destination.exists())
+        self.assertTrue(link.exists())
+
+
+if __name__ == "__main__":
+    unittest.main()

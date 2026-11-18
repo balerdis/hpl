@@ -1,0 +1,374 @@
+"""Behavioural proof that `cli.py`'s user-facing prose never leaks the
+engine's own brand.
+
+Every other test in this suite builds a `Runtime` with no `identity=`
+argument at all, which means it silently gets HPL's own packaged
+`identity.json` back (`Runtime.identity`'s default factory) -- so none of
+them can ever notice a stray `"HPL"` literal sitting in `cli.py`'s
+prose: the fixture and the bug would say the same word by coincidence.
+
+This module builds an obviously-fictional `Identity` (`ACME`, never a real
+organization) and drives every top-level command path through it, then
+greps the rendered output -- prose and machine-readable report alike -- for
+the engine's own brand. A distribution binary is exactly this scenario: its
+own packaged `identity.json` is never `hpl`/`HPL`/`Harness`, so if
+any of these code paths still says so, a real distribution's user reads a
+sentence naming a product they never installed.
+
+The wire-format identifiers that are deliberately identical across every
+distribution (`cli.SCHEMA`, `journal-v4.json`, the `hpl_version`/
+`hpl_installed` JSON *keys*, `HPL_SKILL_REGISTRY_BIN`,
+`HPL_SKILL_ROOTS`, `HPL_NO_UPDATE_CHECK`, and
+`mcp_handshake.CLIENT_NAME`) are explicitly excluded before the brand check,
+since those are supposed to say "hpl" everywhere, forever.
+"""
+from __future__ import annotations
+
+import io
+import json
+from dataclasses import replace
+
+from hpl import cli
+from hpl.adapters import available
+from hpl.core import journal as journal_module
+from hpl.core.identity import Identity, ReleaseSource
+from hpl.core.types import Environment
+from hpl.infra.fs_posix import PosixFileSystem
+from real_home import RealHomeTestCase as _RealHomeTestCase
+
+AT = "2026-08-14T00:00:00+00:00"
+# Pinned to OpenCode, not "whichever adapter is registered first": this
+# suite exercises capabilities (mcp, per_agent_model, subagents declared
+# inside the settings file, ...) that only OpenCode declares today. Since
+# Claude Code registered, "available().ids()[0]" resolves alphabetically
+# to "claudecode" instead, which cannot support what this file tests.
+CLI = "opencode"
+NO_BINARY = {"PATH": ""}
+
+#: An obviously fictional product -- never a real organization -- so a leak
+#: cannot be mistaken for a coincidental match against real-world prose.
+ACME_IDENTITY = Identity(
+    product_id="acme-widget",
+    display_name="Acme",
+    program_name="acme",
+    version="1.0.0",
+    wordmark_words=("ACME",),
+    release=ReleaseSource(
+        asset_url_template="https://github.com/acme-corp/acme-widget/releases/download/{tag}/{asset}",
+        binary_asset="acme-widget",
+        latest_release_api_url="https://api.github.com/repos/acme-corp/acme-widget/releases/latest",
+        release_page_url="https://github.com/acme-corp/acme-widget/releases",
+        install_base_url_default="https://github.com/acme-corp/acme-widget/releases/latest/download",
+    ),
+)
+
+#: Wire identifiers permitted everywhere, per the spec's own allowlist --
+#: stripped out of rendered text before the brand check runs, since some of
+#: them contain the brand substring by design (e.g. `hpl_installed`).
+PERMITTED_WIRE_IDENTIFIERS = (
+    cli.SCHEMA,
+    "journal-v4.json",
+    "hpl_version",
+    "hpl_installed",
+    "HPL_SKILL_REGISTRY_BIN",
+    "HPL_SKILL_ROOTS",
+    "HPL_NO_UPDATE_CHECK",
+    "hpl-doctor",
+)
+
+
+def _scrub_wire_identifiers(text: str) -> str:
+    scrubbed = text
+    for token in PERMITTED_WIRE_IDENTIFIERS:
+        scrubbed = scrubbed.replace(token, "")
+    return scrubbed
+
+
+class BrandAssertionMixin:
+    def assertNoEngineBrand(self, text: str) -> None:
+        scrubbed = _scrub_wire_identifiers(text).lower()
+        for brand in ("hpl", "harness"):
+            self.assertNotIn(brand, scrubbed, f"engine brand {brand!r} leaked in: {text!r}")
+
+
+class AcmeRuntimeTestCase(BrandAssertionMixin, _RealHomeTestCase):
+    """A throwaway home, the real filesystem, and ACME's identity instead of
+    HPL's own -- everything else follows the same discipline
+    `test_cli.py`'s own `RealHomeTestCase` holds every CLI surface test to.
+    """
+
+    def setUp(self):
+        super().setUp()
+        # The base class's own `self.filesystem` is keyed to HPL's own
+        # product id; a distribution's binary would never share that, so this
+        # rebuilds it keyed to ACME's instead, matching what `default_runtime`
+        # would actually do for a real ACME build.
+        self.filesystem = PosixFileSystem(product_id=ACME_IDENTITY.product_id)
+
+    def runtime(self) -> cli.Runtime:
+        return cli.Runtime(
+            filesystem=self.filesystem,
+            home=self.home,
+            now=AT,
+            out=io.StringIO(),
+            variables=NO_BINARY,
+            identity=ACME_IDENTITY,
+        )
+
+    def layout(self):
+        return available().get(CLI).layout(Environment(home=self.home))
+
+    def present(self) -> None:
+        self.layout().config_dir.mkdir(parents=True, exist_ok=True)
+
+    def store(self):
+        return cli.journal_store(self.runtime())
+
+    def run_cli(self, *argv) -> tuple[int, dict]:
+        context = self.runtime()
+        code = cli.main([*argv, "--json"], runtime=context)
+        return code, json.loads(context.out.getvalue())
+
+    def run_prose(self, *argv) -> tuple[int, str]:
+        context = self.runtime()
+        code = cli.main(list(argv), runtime=context)
+        return code, context.out.getvalue()
+
+    def install(self, *extra) -> None:
+        self.present()
+        code, _ = self.run_cli("install", "--cli", CLI, *extra)
+        self.assertEqual(code, 0)
+
+    def drop_mcp_bindings(self) -> None:
+        journal = self.store().load()
+        install = journal_module.install_for(journal, CLI)
+        self.store().save(journal_module.with_install(journal, replace(install, mcp_bindings={})))
+
+
+class InstallBrandLeakTest(AcmeRuntimeTestCase):
+    def test_install_prose_has_no_engine_brand(self):
+        self.present()
+        _code, prose = self.run_prose("install", "--cli", CLI)
+        self.assertNoEngineBrand(prose)
+
+    def test_install_json_report_has_no_engine_brand(self):
+        """Scoped to the fields `cli.py` itself renders: `schema`, `journal`,
+        `activation`. `created`/`updated` -- the catalog artifacts this install
+        actually placed -- get their own test right below, derived from the
+        report instead of hand-picked, so a new artifact with a fixed brand
+        breaks that test the moment it ships."""
+        self.present()
+        _code, report = self.run_cli("install", "--cli", CLI)
+        self.assertNoEngineBrand(report["schema"])
+        self.assertNoEngineBrand(report["journal"])
+        self.assertNoEngineBrand(" ".join(report["activation"]))
+
+    def test_created_and_updated_artifact_names_have_no_engine_brand(self):
+        """The debt `test_install_json_report_has_no_engine_brand` used to
+        admit and exclude: `created`/`updated` name catalog artifacts, and a
+        fixed engine-branded name among them is exactly as much a leak as one
+        in `cli.py`'s own prose.
+
+        Scoped to the artifacts an *adapter* names on its own -- its `id`
+        starts with `own:`, or it is the system prompt (`system-prompt:{name}`,
+        which carries the identity-derived filename since the id started
+        naming it explicitly, or the fixed `system-prompt-instruction`) --
+        derived from the id prefix `own_artifacts` itself uses rather than a
+        hand-picked list of filenames, so a new adapter-owned artifact with a
+        fixed brand fails this the moment it ships.
+
+        Deliberately NOT scoped to every entry: an agent, skill or command's
+        own *name* is content-authored data (`core.content`), never a name
+        this adapter derives from `Identity` -- `king-hpl`, one of this
+        repository's own shipped persona names, is exactly this shape, and
+        would fail here as a false positive. Renaming a content-declared
+        identifier is a real, still-open piece of brand debt, but it is a
+        content-authoring concern with its own blast radius, not the
+        artifact-naming debt this test (and this change) closes -- excluded
+        here by name, not silently, so it stays visible as unfinished.
+        """
+        self.present()
+        _code, report = self.run_cli("install", "--cli", CLI)
+        placed = report["created"] + report["updated"]
+        self.assertTrue(placed, "fixture drifted: install placed nothing")
+        adapter_owned = [
+            entry
+            for entry in placed
+            if entry["id"].startswith("own:")
+            or entry["id"] == "system-prompt-instruction"
+            or entry["id"].startswith("system-prompt:")
+        ]
+        self.assertTrue(adapter_owned, "fixture drifted: no adapter-owned artifact was placed")
+        for entry in adapter_owned:
+            self.assertNoEngineBrand(entry["id"])
+            self.assertNoEngineBrand(entry["target"])
+
+    def test_dropped_grant_warning_has_no_engine_brand(self):
+        """Covers the `hpl mcp grant --cli ...` suggested-command literal
+        that used to live inside `install`'s own `grant_warnings` message."""
+        self.install()
+        self.declare_own_mcp_server("jira-mcp")
+        self.run_cli("mcp", "grant", "--cli", CLI, "jira-mcp")
+        _code, report = self.run_cli("install", "--cli", CLI, "--mcp", "cbm=jira-mcp")
+        self.assertTrue(report.get("grant_warnings"))
+        self.assertNoEngineBrand(" ".join(report["grant_warnings"]))
+
+    def declare_own_mcp_server(self, key: str) -> None:
+        from hpl.core import codecs, pointer
+        from hpl.core.types import Codec
+
+        layout = self.layout()
+        document = codecs.loads(Codec.JSON, layout.settings_file.read_text(encoding="utf-8"))
+        document = pointer.set_at(document, f"/mcp/{key}", {"type": "local", "command": ["jira-server"]})
+        layout.settings_file.write_text(codecs.dumps(Codec.JSON, document), encoding="utf-8")
+
+
+class UninstallBrandLeakTest(AcmeRuntimeTestCase):
+    def test_not_installed_error_has_no_engine_brand(self):
+        self.present()
+        _code, report = self.run_cli("uninstall", "--cli", CLI)
+        self.assertEqual(report["status"], "failed")
+        self.assertNoEngineBrand(report["error"])
+
+    def test_uninstall_prose_has_no_engine_brand(self):
+        self.install()
+        _code, prose = self.run_prose("uninstall", "--cli", CLI)
+        self.assertNoEngineBrand(prose)
+
+
+class McpBrandLeakTest(AcmeRuntimeTestCase):
+    def test_grant_undeclared_key_error_has_no_engine_brand(self):
+        self.install()
+        _code, report = self.run_cli("mcp", "grant", "--cli", CLI, "no-such-key")
+        self.assertEqual(report["status"], "failed")
+        self.assertNoEngineBrand(report["error"])
+
+    def test_unresolved_binding_blocks_list_with_no_engine_brand(self):
+        """Covers `install_command_for` and `unresolved_bindings_message`,
+        both of which used to hardcode the `hpl install --cli ...`
+        remedy command verbatim."""
+        self.present()
+        code, _ = self.run_cli("install", "--cli", CLI, "--mcp", "cbm=acme-widget-key")
+        self.assertEqual(code, 0)
+        self.drop_mcp_bindings()
+        _code, report = self.run_cli("mcp", "list", "--cli", CLI)
+        self.assertTrue(report["blocked"])
+        self.assertIn("cbm", report["blocked"])
+        self.assertNoEngineBrand(report["blocked"])
+
+    def test_unresolved_binding_blocks_update_with_no_engine_brand(self):
+        self.present()
+        code, _ = self.run_cli("install", "--cli", CLI, "--mcp", "cbm=acme-widget-key")
+        self.assertEqual(code, 0)
+        self.drop_mcp_bindings()
+        _code, report = self.run_cli("update", "--cli", CLI)
+        self.assertNotEqual(_code, 0)
+        self.assertNoEngineBrand(report["error"])
+
+
+class DoctorBrandLeakTest(AcmeRuntimeTestCase):
+    def test_not_installed_prose_has_no_engine_brand(self):
+        """Covers `_cli_prose`'s "HPL not installed" literal."""
+        self.present()
+        _code, prose = self.run_prose("doctor")
+        self.assertNoEngineBrand(prose)
+
+    def test_installed_prose_has_no_engine_brand(self):
+        self.install()
+        _code, prose = self.run_prose("doctor")
+        self.assertNoEngineBrand(prose)
+
+    def test_bound_server_detail_has_no_engine_brand(self):
+        """Covers `_bound_checks`'s "whose tools HPL grants" literal."""
+        self.present()
+        code, _ = self.run_cli("install", "--cli", CLI, "--mcp", "cbm=acme-widget-key")
+        self.assertEqual(code, 0)
+        _code, report = self.run_cli("doctor")
+        entry = next(item for item in report["clis"] if item["cli"] == CLI)
+        self.assertTrue(entry["mcp_bound"])
+        self.assertNoEngineBrand(entry["mcp_bound"][0]["detail"])
+
+    def test_bound_server_detail_with_unknown_key_has_no_engine_brand(self):
+        self.present()
+        code, _ = self.run_cli("install", "--cli", CLI, "--mcp", "cbm=acme-widget-key")
+        self.assertEqual(code, 0)
+        self.drop_mcp_bindings()
+        _code, report = self.run_cli("doctor")
+        entry = next(item for item in report["clis"] if item["cli"] == CLI)
+        self.assertTrue(entry["mcp_bound"])
+        self.assertNoEngineBrand(entry["mcp_bound"][0]["detail"])
+        self.assertTrue(entry.get("mcp_bound_unknown_keys"))
+        self.assertNoEngineBrand(entry["mcp_bound_unknown_keys"]["command"])
+
+
+class RestoreBrandLeakTest(AcmeRuntimeTestCase):
+    def test_no_snapshot_error_has_no_engine_brand(self):
+        self.present()
+        _code, report = self.run_cli("restore")
+        self.assertEqual(report["status"], "failed")
+        self.assertNoEngineBrand(report["error"])
+
+    def test_restore_prose_has_no_engine_brand(self):
+        self.install()
+        _code, prose = self.run_prose("restore")
+        self.assertNoEngineBrand(prose)
+
+
+class UpdateBrandLeakTest(AcmeRuntimeTestCase):
+    def test_update_prose_has_no_engine_brand(self):
+        self.install()
+        _code, prose = self.run_prose("update", "--cli", CLI)
+        self.assertNoEngineBrand(prose)
+
+
+class ModelsBrandLeakTest(AcmeRuntimeTestCase):
+    """`models set`/`models unset` render what they record, so their report is
+    an `install` report with the assignment's own fields merged onto it -- the
+    same fields `InstallBrandLeakTest` already holds `install` to, now reachable
+    through a second command. Scoped to what `cli.py` itself renders, for the
+    reason that test states.
+
+    This used to cover `_NOT_INSTALLED_YET`'s own "hpl install --cli ..."
+    literal, which was the one place these two commands built a branded
+    sentence of their own. That sentence is gone: the assignment reaches the
+    configuration in the same command now, so what is left to do is the
+    adapter's own activation step and nothing here spells a program name.
+    """
+
+    AGENT = "sdd-apply"
+
+    def test_models_set_report_has_no_engine_brand(self):
+        self.install()
+        _code, report = self.run_cli(
+            "models", "set", "--cli", CLI, "--assign", f"{self.AGENT}=anthropic/claude-sonnet-5",
+        )
+        self.assertNoEngineBrand(report["schema"])
+        self.assertNoEngineBrand(report["journal"])
+        self.assertNoEngineBrand(" ".join(report["activation"]))
+
+    def test_models_unset_report_has_no_engine_brand(self):
+        self.install()
+        self.run_cli(
+            "models", "set", "--cli", CLI, "--assign", f"{self.AGENT}=anthropic/claude-sonnet-5",
+        )
+        _code, report = self.run_cli("models", "unset", "--cli", CLI, "--agent", self.AGENT)
+        self.assertNoEngineBrand(report["schema"])
+        self.assertNoEngineBrand(report["journal"])
+        self.assertNoEngineBrand(" ".join(report["activation"]))
+
+    def test_models_set_refusal_has_no_engine_brand(self):
+        """The refusal a CLI with nothing installed gets -- a sentence these
+        two commands only started saying once they began rendering."""
+        self.present()
+        _code, report = self.run_cli(
+            "models", "set", "--cli", CLI, "--assign", f"{self.AGENT}=anthropic/claude-sonnet-5",
+        )
+        self.assertEqual(report["status"], "failed")
+        self.assertNoEngineBrand(report["error"])
+
+
+class UpgradeBrandLeakTest(AcmeRuntimeTestCase):
+    def test_not_an_installed_executable_error_has_no_engine_brand(self):
+        _code, report = self.run_cli("upgrade")
+        self.assertEqual(report["status"], "failed")
+        self.assertNoEngineBrand(report["error"])

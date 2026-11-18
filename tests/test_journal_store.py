@@ -1,0 +1,329 @@
+"""Persisting the ownership journal.
+
+The store is the only thing between a correct journal and a home directory
+HPL can no longer retire from cleanly, so its refusals matter as much as its
+writes. Everything here runs against a fake filesystem: the store's job is
+policy, and the port already proves the writing.
+"""
+from __future__ import annotations
+
+import json
+import stat
+import unittest
+from pathlib import Path
+
+from fakes import FakeFileSystem
+from hpl.core import journal as journal_module
+from hpl.core.journal import Install, Record
+from hpl.infra.journal_store_file import FileJournalStore, journal_path
+from hpl.ports.filesystem import FileSystemError
+from hpl.ports.journal_store import JournalStore, JournalStoreError
+from real_home import RealHomeTestCase as _RealHomeTestCase
+
+HOME = Path("/home/probe")
+CONFIG = HOME / ".config" / "some-cli"
+AT = "2026-08-14T00:00:00+00:00"
+VERSION = "4.0.0"
+
+
+def install() -> Install:
+    return Install(
+        cli="some-cli",
+        installed_at=AT,
+        config_dir=CONFIG,
+        release={"version": VERSION, "content_digest": "sha256:" + "c" * 64},
+        entries=(
+            Record(
+                id="skill:alpha",
+                kind="file",
+                target=CONFIG / "skills/alpha/SKILL.md",
+                after_digest="sha256:" + "a" * 64,
+                created_at=AT,
+                mode="0644",
+            ),
+        ),
+    )
+
+
+def store(filesystem: FakeFileSystem) -> FileJournalStore:
+    return FileJournalStore(filesystem, home=HOME, hpl_version=VERSION)
+
+
+class JournalPathTest(unittest.TestCase):
+    def test_the_path_is_arithmetic_on_the_filesystems_own_data_dir(self):
+        filesystem = FakeFileSystem()
+        home = Path("/nonexistent/hpl-probe")
+        self.assertEqual(
+            journal_path(filesystem, home),
+            filesystem.data_dir(home) / "journal-v4.json",
+        )
+
+    def test_the_journal_does_not_share_a_name_with_another_schema_version(self):
+        """A journal of another schema version lives in its own file, never a rewrite of this one."""
+        self.assertNotIn("journal-v3", journal_path(FakeFileSystem(), HOME).name)
+
+
+class FileJournalStoreTest(unittest.TestCase):
+    def test_the_file_store_satisfies_the_port(self):
+        self.assertIsInstance(store(FakeFileSystem()), JournalStore)
+
+    # --- Loading ---
+
+    def test_loading_without_a_file_yields_an_empty_journal(self):
+        loaded = store(FakeFileSystem()).load()
+        self.assertEqual(loaded, journal_module.empty(VERSION))
+
+    def test_loading_does_not_create_the_file(self):
+        filesystem = FakeFileSystem()
+        store(filesystem).load()
+        self.assertEqual(filesystem.files, {})
+
+    def test_a_saved_journal_loads_back_unchanged(self):
+        filesystem = FakeFileSystem()
+        subject = store(filesystem)
+        original = journal_module.with_install(journal_module.empty(VERSION), install())
+        subject.save(original)
+        self.assertEqual(subject.load(), original)
+
+    def test_unreadable_json_is_refused_rather_than_treated_as_empty(self):
+        """Silently starting over would orphan everything already installed."""
+        filesystem = FakeFileSystem(files={journal_path(FakeFileSystem(), HOME): b"{ not json"})
+        with self.assertRaises(JournalStoreError):
+            store(filesystem).load()
+
+    def test_a_journal_the_core_rejects_is_refused(self):
+        payload = json.dumps({"schema": "hpl/journal/v99", "hpl_version": VERSION}).encode("utf-8")
+        filesystem = FakeFileSystem(files={journal_path(FakeFileSystem(), HOME): payload})
+        with self.assertRaises(JournalStoreError):
+            store(filesystem).load()
+
+    def test_a_malformed_granted_directories_entry_is_quarantined_not_fatal(self):
+        """A hand-edited or corrupted `granted_directories` entry used to
+        leave every command that reads the journal refusing with "the
+        journal is malformed" -- `doctor`, `install`, `update`, `uninstall`,
+        and `directory revoke` included, `directory revoke` (the one command
+        that could remove the bad entry) among them. It is now quarantined
+        instead: the load succeeds, and the entry lands in
+        `Install.quarantined_directories` rather than `granted_directories`."""
+        payload = json.loads(json.dumps(journal_module.to_dict(
+            journal_module.with_install(journal_module.empty(VERSION), install())
+        )))
+        payload["installs"][0]["granted_directories"] = ["/"]
+        path = journal_path(FakeFileSystem(), HOME)
+        filesystem = FakeFileSystem(files={path: json.dumps(payload).encode("utf-8")})
+        loaded = store(filesystem).load()
+        parsed_install = journal_module.install_for(loaded, "some-cli")
+        self.assertEqual(parsed_install.granted_directories, ())
+        self.assertEqual(parsed_install.quarantined_directories, ("/",))
+
+    def test_a_granted_directories_value_that_is_not_a_list_names_the_file_and_the_field(self):
+        """The one shape quarantine cannot cover -- `granted_directories`
+        itself not being a list, with no per-element structure to preserve
+        -- still refuses the whole journal, naming the file and the field."""
+        payload = json.loads(json.dumps(journal_module.to_dict(
+            journal_module.with_install(journal_module.empty(VERSION), install())
+        )))
+        payload["installs"][0]["granted_directories"] = "not-a-list"
+        path = journal_path(FakeFileSystem(), HOME)
+        filesystem = FakeFileSystem(files={path: json.dumps(payload).encode("utf-8")})
+        with self.assertRaises(JournalStoreError) as raised:
+            store(filesystem).load()
+        message = str(raised.exception)
+        self.assertIn(str(path), message)
+        self.assertIn("granted_directories", message)
+
+    def test_a_journal_holding_a_target_outside_the_home_is_refused(self):
+        """The core enforces containment; the store must not swallow that refusal."""
+        payload = json.loads(json.dumps(journal_module.to_dict(
+            journal_module.with_install(journal_module.empty(VERSION), install())
+        )))
+        payload["installs"][0]["entries"][0]["target"] = "/etc/passwd"
+        filesystem = FakeFileSystem(files={journal_path(FakeFileSystem(), HOME): json.dumps(payload).encode("utf-8")})
+        with self.assertRaises(JournalStoreError):
+            store(filesystem).load()
+
+    def test_a_filesystem_failure_while_reading_surfaces_as_a_store_error(self):
+        class Unreadable(FakeFileSystem):
+            def exists(self, path: Path) -> bool:
+                return True
+
+            def read_bytes(self, path: Path) -> bytes:
+                raise FileSystemError("permission denied")
+
+        with self.assertRaises(JournalStoreError):
+            store(Unreadable()).load()
+
+    def test_a_journal_whose_existence_cannot_be_told_refuses_rather_than_loading_as_empty(self):
+        """`load`'s `if not exists(): return empty()` would turn "cannot tell"
+        into "there is no journal at all" — everything HPL ever recorded
+        installing would vanish from this call's point of view, and every
+        command built on top of it would proceed as if none of it happened.
+        This runs before anything is written, so refusing costs nothing."""
+        filesystem = FakeFileSystem(fail_exists={journal_path(FakeFileSystem(), HOME)})
+        with self.assertRaises(FileSystemError):
+            store(filesystem).load()
+
+    # --- Saving ---
+
+    def test_saving_writes_to_the_journal_path(self):
+        filesystem = FakeFileSystem()
+        store(filesystem).save(journal_module.empty(VERSION))
+        self.assertIn(journal_path(FakeFileSystem(), HOME), filesystem.files)
+
+    def test_saving_keeps_the_journal_private_to_its_owner(self):
+        filesystem = FakeFileSystem()
+        store(filesystem).save(journal_module.empty(VERSION))
+        self.assertEqual(filesystem.modes[journal_path(FakeFileSystem(), HOME)], 0o600)
+
+    def test_saving_creates_the_data_directory_first(self):
+        filesystem = FakeFileSystem()
+        store(filesystem).save(journal_module.empty(VERSION))
+        self.assertIn(journal_path(FakeFileSystem(), HOME).parent, filesystem.directories)
+
+    def test_the_written_file_is_readable_json_ending_in_a_newline(self):
+        filesystem = FakeFileSystem()
+        store(filesystem).save(journal_module.with_install(journal_module.empty(VERSION), install()))
+        written = filesystem.files[journal_path(FakeFileSystem(), HOME)].decode("utf-8")
+        self.assertTrue(written.endswith("\n"))
+        self.assertEqual(json.loads(written)["schema"], journal_module.SCHEMA)
+
+    def test_a_home_that_is_not_writable_on_behalf_of_its_owner_must_not_get_a_journal(self):
+        filesystem = FakeFileSystem(writable=False)
+        with self.assertRaises(JournalStoreError):
+            store(filesystem).save(journal_module.empty(VERSION))
+        self.assertEqual(filesystem.files, {})
+
+    # --- Asking before doing ---
+
+    def test_ensure_writable_passes_when_saving_would_work(self):
+        store(FakeFileSystem()).ensure_writable()
+
+    def test_ensure_writable_refuses_a_home_that_is_not_writable_on_behalf_of_its_owner(self):
+        """The refusal must arrive before an install, not after it."""
+        filesystem = FakeFileSystem(writable=False)
+        with self.assertRaises(JournalStoreError):
+            store(filesystem).ensure_writable()
+        self.assertEqual(filesystem.files, {})
+
+    def test_ensure_writable_writes_nothing_of_its_own(self):
+        filesystem = FakeFileSystem()
+        store(filesystem).ensure_writable()
+        self.assertEqual(filesystem.writes, [])
+
+    def test_a_filesystem_failure_while_writing_surfaces_as_a_store_error(self):
+        class Unwritable(FakeFileSystem):
+            def write_atomic(self, path: Path, content: bytes, *, mode: int = 0o644) -> None:
+                raise FileSystemError("no space left on device")
+
+        with self.assertRaises(JournalStoreError):
+            store(Unwritable()).save(journal_module.empty(VERSION))
+
+    def test_a_journal_recording_a_target_outside_the_home_is_never_written(self):
+        """Containment is checked on the way out too, not only on the way in."""
+        outside = Install(
+            cli="some-cli",
+            installed_at=AT,
+            config_dir=CONFIG,
+            release={},
+            entries=(
+                Record(
+                    id="skill:alpha",
+                    kind="file",
+                    target=Path("/etc/passwd"),
+                    after_digest="sha256:" + "a" * 64,
+                    created_at=AT,
+                ),
+            ),
+        )
+        filesystem = FakeFileSystem()
+        with self.assertRaises(JournalStoreError):
+            store(filesystem).save(journal_module.with_install(journal_module.empty(VERSION), outside))
+        self.assertEqual(filesystem.files, {})
+
+    def test_saving_stamps_the_version_of_the_binary_doing_the_writing(self):
+        """The field names who wrote the journal last, not who created it.
+
+        Only `empty()` ever set it, so a journal created by one version and
+        then written by every upgrade after it went on naming the first one.
+        """
+        filesystem = FakeFileSystem()
+        path = journal_path(FakeFileSystem(), HOME)
+        stale = journal_module.to_dict(journal_module.empty("3.0.0"))
+        filesystem.files[path] = json.dumps(stale).encode("utf-8")
+        subject = store(filesystem)
+        subject.save(subject.load())
+        written = json.loads(filesystem.files[path].decode("utf-8"))
+        self.assertEqual(written["hpl_version"], VERSION)
+
+    def test_stamping_the_version_leaves_the_rest_of_the_journal_alone(self):
+        filesystem = FakeFileSystem()
+        path = journal_path(FakeFileSystem(), HOME)
+        stale = journal_module.with_install(journal_module.empty("3.0.0"), install())
+        filesystem.files[path] = json.dumps(journal_module.to_dict(stale)).encode("utf-8")
+        subject = store(filesystem)
+        subject.save(subject.load())
+        reloaded = subject.load()
+        self.assertEqual(reloaded.hpl_version, VERSION)
+        self.assertEqual(reloaded.installs, stale.installs)
+
+    def test_saving_twice_replaces_rather_than_appends(self):
+        filesystem = FakeFileSystem()
+        subject = store(filesystem)
+        subject.save(journal_module.with_install(journal_module.empty(VERSION), install()))
+        subject.save(journal_module.empty(VERSION))
+        self.assertEqual(subject.load(), journal_module.empty(VERSION))
+
+
+class FileJournalStoreOnRealDiskTest(_RealHomeTestCase):
+    """The fake proves the policy; this proves the two halves actually compose."""
+
+    def setUp(self):
+        super().setUp()
+        self.store = FileJournalStore(self.filesystem, home=self.home, hpl_version=VERSION)
+
+    def real_install(self) -> Install:
+        config = self.home / ".config" / "some-cli"
+        return Install(
+            cli="some-cli",
+            installed_at=AT,
+            config_dir=config,
+            release={"version": VERSION},
+            entries=(
+                Record(
+                    id="skill:alpha",
+                    kind="file",
+                    target=config / "skills/alpha/SKILL.md",
+                    after_digest="sha256:" + "a" * 64,
+                    created_at=AT,
+                    mode="0644",
+                ),
+            ),
+        )
+
+    def test_the_version_on_disk_names_the_binary_that_wrote_it_last(self):
+        """Two real binaries, one file: the second one has to leave its mark."""
+        older = FileJournalStore(self.filesystem, home=self.home, hpl_version="3.0.0")
+        older.save(journal_module.with_install(journal_module.empty("3.0.0"), self.real_install()))
+        self.store.save(self.store.load())
+        written = json.loads(journal_path(self.filesystem, self.home).read_text(encoding="utf-8"))
+        self.assertEqual(written["hpl_version"], VERSION)
+
+    def test_an_absent_journal_reads_as_empty_without_creating_anything(self):
+        self.assertEqual(self.store.load(), journal_module.empty(VERSION))
+        self.assertFalse(journal_path(self.filesystem, self.home).exists())
+
+    def test_a_journal_survives_a_round_trip_through_the_real_filesystem(self):
+        original = journal_module.with_install(journal_module.empty(VERSION), self.real_install())
+        self.store.save(original)
+        self.assertEqual(self.store.load(), original)
+
+    def test_the_stored_file_is_private_and_leaves_no_partial_behind(self):
+        self.store.save(journal_module.empty(VERSION))
+        stored = journal_path(self.filesystem, self.home)
+        self.assertEqual(stat.S_IMODE(stored.stat().st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE(stored.parent.stat().st_mode), 0o700)
+        self.assertEqual([item.name for item in stored.parent.iterdir()], [stored.name])
+
+
+if __name__ == "__main__":
+    unittest.main()

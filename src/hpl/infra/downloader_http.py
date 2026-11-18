@@ -1,0 +1,116 @@
+"""The real downloader: plain HTTP(S), for a released binary HPL does not ship.
+
+The suite refuses any real socket connection outright (see ``tests/no_network.py``,
+imported through ``tests/fakes.py``) -- so proving *this* class correct
+against a real server is outside what a hermetic suite can promise, and is
+not attempted here. Every test that needs a
+:class:`~hpl.ports.downloader.Downloader` for the rest of the pipeline
+(checksum verification, placement) reaches for the fake in ``tests/fakes.py``
+instead; only ``tests/test_downloader_http.py`` reaches into this module
+itself, and even that stays inside the refusal by patching
+`urllib.request.urlopen` to a fake response object rather than opening a
+socket at all -- it proves the chunked reading and the progress callback,
+never a live fetch.
+"""
+from __future__ import annotations
+
+import http.client
+import urllib.error
+import urllib.request
+from typing import Callable
+
+from hpl.ports.downloader import DownloaderError
+
+TIMEOUT_SECONDS = 30
+
+#: How much of the body to read per `response.read()` call. A single call
+#: covering the whole body -- the previous behaviour -- reports nothing to
+#: `on_progress` until it is already finished, which is exactly the bug this
+#: module exists to fix. The other extreme, reading a handful of bytes at a
+#: time, would call `on_progress` thousands of times a second for a multi-
+#: megabyte archive, burning cycles a render loop never asked for. 64KB sits
+#: between those: small enough that even a slow link updates a few times a
+#: second (the engram archive this exists for is ~6.9MB, so ~110 calls total),
+#: large enough that a fast one never turns the callback into the bottleneck.
+_CHUNK_SIZE = 65536
+
+
+class HttpDownloader:
+    """Fetches a URL's whole body over HTTP(S), in chunks so a caller can
+    watch the bytes arrive instead of blocking on one opaque `.read()`."""
+
+    def fetch(
+        self,
+        url: str,
+        *,
+        timeout_seconds: float | None = None,
+        on_progress: Callable[[int, int | None], None] | None = None,
+    ) -> bytes:
+        timeout = TIMEOUT_SECONDS if timeout_seconds is None else timeout_seconds
+        try:
+            with urllib.request.urlopen(url, timeout=timeout) as response:  # noqa: S310
+                total = _content_length(response)
+                downloaded = 0
+                chunks: list[bytes] = []
+                while True:
+                    chunk = response.read(_CHUNK_SIZE)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                    downloaded += len(chunk)
+                    if on_progress is not None:
+                        on_progress(downloaded, total)
+                return b"".join(chunks)
+        except urllib.error.HTTPError as error:
+            # An HTTP answer, not a transport failure: keep the status so a
+            # caller can say "not found / no access" instead of "network
+            # down". GitHub answers an anonymous caller that went over its
+            # per-address budget with 403 (or 429) and
+            # `X-RateLimit-Remaining: 0` / `Retry-After`; that is a wait, not
+            # a refusal, so it is flagged separately.
+            raise DownloaderError(
+                str(error), status=error.code, rate_limited=_is_rate_limited(error)
+            ) from error
+        except (OSError, ValueError, http.client.HTTPException) as error:
+            # `http.client.HTTPException` is the base for every protocol-level
+            # failure `http.client` raises -- `InvalidURL` (a malformed URL,
+            # e.g. a non-numeric port) among them -- and none of its subclasses
+            # derive from `OSError` or `ValueError`, so `urlopen` raising one
+            # would otherwise escape this boundary as a raw, undocumented
+            # exception instead of the `DownloaderError` callers expect.
+            #
+            # The message carries only `error` -- `ports.downloader` makes no
+            # promise that `DownloaderError`'s text contains `url`, so this
+            # adapter does not add it: every caller already has `url` (it is
+            # what it passed in) and adds it itself if its own message needs
+            # it. Folding it in here too would let a caller lean on this
+            # adapter's own formatting instead of the port's actual contract,
+            # and would print it twice for a caller that does add it.
+            raise DownloaderError(str(error)) from error
+
+
+def _content_length(response) -> int | None:
+    """The response's declared size, or `None` when it did not declare one --
+    never a guessed number in its place. A malformed header (present but not
+    an integer) is treated the same as an absent one: an untrustworthy total
+    is no better than no total at all.
+    """
+    value = response.headers.get("Content-Length")
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return None
+
+
+def _is_rate_limited(error: urllib.error.HTTPError) -> bool:
+    """Whether this HTTP error is a rate limit rather than a refusal."""
+    if error.code == 429:
+        return True
+    if error.code != 403:
+        return False
+    headers = error.headers
+    if headers is None:
+        return False
+    return headers.get("X-RateLimit-Remaining") == "0" or headers.get("Retry-After") is not None

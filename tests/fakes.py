@@ -1,0 +1,354 @@
+"""Test doubles shared across the suite.
+
+The filesystem port exists so that everything above it can be proven without a
+home directory to ruin. This is the implementation that makes good on that.
+The downloader port exists so a `download` server's materialization can be
+proven the same way, without ever reaching out for real bytes, and the npm
+installer port does the same for an `npm` server -- without ever spawning a
+real `npm` process. The socket patch just below makes that structural rather
+than a matter of every test remembering to use the fake: this module is
+already imported, at
+collection time, by several test files this suite has always had (`test_cli`,
+`test_journal_store`, `test_snapshot_store`, `test_fakes` among them), and
+`unittest discover` imports every test module before running any of them, so
+the patch is in place before a single test method executes.
+"""
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Callable
+
+import no_network  # noqa: F401  -- importing it is what installs the refusal
+from hpl.infra.downloader_http import TIMEOUT_SECONDS as _DEFAULT_DOWNLOAD_TIMEOUT_SECONDS
+from hpl.ports.downloader import DownloaderError
+from hpl.ports.filesystem import FileSystemError
+from hpl.ports.mcp_process import MCPExchange
+from hpl.ports.npm_installer import NpmInstallerError
+
+DEFAULT_MODE = 0o644
+DEFAULT_DIR_MODE = 0o755
+EXECUTABLE_MODE = 0o755
+_OWNER_EXECUTE_BIT = 0o100
+
+
+class FakeDownloader:
+    """A downloader that answers from a fixed table instead of the network.
+
+    A URL absent from the table fails exactly the way a real fetch of a wrong
+    URL would -- there is no fallback to an actual request, because there is
+    no network code in this class at all for a fallback to reach.
+    """
+
+    def __init__(
+        self,
+        responses: dict[str, bytes] | None = None,
+        *,
+        chunk_reports: list[tuple[int, int | None]] | None = None,
+    ):
+        self.responses: dict[str, bytes] = dict(responses or {})
+        self.calls: list[str] = []
+        # Mirrors what `HttpDownloader` actually does with `timeout_seconds`:
+        # `None` collapses to its real default, so a test can tell a caller
+        # that asked for the long default apart from one that asked short.
+        self.timeouts: list[float] = []
+        # `on_progress` is never called unless a test opts in here -- every
+        # test written before that param existed passes no `chunk_reports`
+        # and sees no calls at all, which is exactly the behaviour a real,
+        # instant-return fake ought to have. A test proving the wiring from
+        # `core.dependencies` up through `cli.Progress` opts in with the
+        # sequence of `(bytes_downloaded, total)` pairs it wants replayed.
+        self.chunk_reports = list(chunk_reports) if chunk_reports is not None else None
+
+    def fetch(
+        self,
+        url: str,
+        *,
+        timeout_seconds: float | None = None,
+        on_progress: Callable[[int, int | None], None] | None = None,
+    ) -> bytes:
+        self.calls.append(url)
+        self.timeouts.append(_DEFAULT_DOWNLOAD_TIMEOUT_SECONDS if timeout_seconds is None else timeout_seconds)
+        if url not in self.responses:
+            raise DownloaderError(f"no fake response registered for {url}")
+        if on_progress is not None and self.chunk_reports is not None:
+            for downloaded, total in self.chunk_reports:
+                on_progress(downloaded, total)
+        return self.responses[url]
+
+
+class FakeNpmInstaller:
+    """An installer that answers from a table of outcomes instead of a real `npm`.
+
+    A directory absent from ``failures`` succeeds and writes nothing further:
+    the fake never touches the filesystem, since what a real `npm ci` would
+    place there is never read back by anything this suite proves.
+    """
+
+    def __init__(self, *, failures: dict[Path, str] | None = None):
+        self.failures: dict[Path, str] = dict(failures or {})
+        self.calls: list[Path] = []
+
+    def install(self, directory: Path) -> None:
+        self.calls.append(directory)
+        if directory in self.failures:
+            raise NpmInstallerError(self.failures[directory])
+
+
+class FakeMCPProcess:
+    """An MCP process that answers from a table of exchanges instead of a real one.
+
+    Keyed by the command tuple, so a test can hand each configured server a
+    different outcome without ever spawning anything.
+    """
+
+    def __init__(self, *, exchanges: dict[tuple[str, ...], MCPExchange] | None = None):
+        self.exchanges: dict[tuple[str, ...], MCPExchange] = dict(exchanges or {})
+        self.calls: list[tuple[tuple[str, ...], str, float]] = []
+
+    def exchange(self, command: tuple[str, ...], request: str, timeout_seconds: float) -> MCPExchange:
+        self.calls.append((command, request, timeout_seconds))
+        if command not in self.exchanges:
+            raise AssertionError(f"no fake exchange registered for {command!r}")
+        return self.exchanges[command]
+
+
+class FakeFileSystem:
+    """An in-memory filesystem that answers the port and records what it was told.
+
+    Beyond storing bytes it can be told to fail: ``fail_on`` names the paths
+    whose next write must raise, which is how rollback gets exercised without
+    filling a real disk. ``fail_mode`` is the same for a path whose permission
+    bits cannot be read, which the port reports by raising rather than by
+    answering ``None`` -- ``None`` means absent and nothing else.
+    ``fail_exists`` is the same idea for a probe rather
+    than a write — without it, a caller that cannot tell whether a path exists
+    was not constructible in a test at all.
+    """
+
+    def __init__(
+        self,
+        *,
+        files: dict[Path, bytes] | None = None,
+        modes: dict[Path, int] | None = None,
+        writable: bool = True,
+        fail_on: set[Path] | None = None,
+        fail_always: set[Path] | None = None,
+        fail_remove: set[Path] | None = None,
+        fail_remove_dir: set[Path] | None = None,
+        fail_remove_empty_dir: set[Path] | None = None,
+        fail_list: set[Path] | None = None,
+        fail_read: set[Path] | None = None,
+        fail_exists: set[Path] | None = None,
+        fail_mode: set[Path] | None = None,
+        fail_is_symlink: set[Path] | None = None,
+        unwritable: set[Path] | None = None,
+        unowned: set[Path] | None = None,
+        symlinks: set[Path] | None = None,
+        symlinked_directories: set[Path] | None = None,
+    ):
+        self.files: dict[Path, bytes] = dict(files or {})
+        self.modes: dict[Path, int] = dict(modes or {})
+        self.directories: set[Path] = set()
+        self.directory_modes: dict[Path, int] = {}
+        self.writable = writable
+        self.fail_on: set[Path] = set(fail_on or ())
+        self.fail_always: set[Path] = set(fail_always or ())
+        self.fail_remove: set[Path] = set(fail_remove or ())
+        self.fail_remove_dir: set[Path] = set(fail_remove_dir or ())
+        self.fail_remove_empty_dir: set[Path] = set(fail_remove_empty_dir or ())
+        self.fail_list: set[Path] = set(fail_list or ())
+        self.fail_read: set[Path] = set(fail_read or ())
+        self.fail_mode: set[Path] = set(fail_mode or ())
+        self.fail_exists: set[Path] = set(fail_exists or ())
+        self.fail_is_symlink: set[Path] = set(fail_is_symlink or ())
+        # Paths `is_symlink` answers `True` for -- a test's way of putting a
+        # path into the same "is a symlink" condition a real one carries,
+        # without a real filesystem to create one against. Membership here is
+        # authoritative regardless of whether the path is also in `files` or
+        # `directories`: a symlink is neither of those, it is its own kind of
+        # entry, and a fake that required one of the other two first could
+        # not model a dangling symlink at all.
+        self.symlinks: set[Path] = set(symlinks or ())
+        # The subset of `symlinks` that `resolves_to_directory` answers
+        # `True` for -- a symlink not named here answers `False`, the same
+        # default a dangling target or a symlink to a plain file gets on a
+        # real filesystem. A path outside `symlinks` entirely falls through
+        # to the plain "is it in `directories`" check instead.
+        self.symlinked_directories: set[Path] = set(symlinked_directories or ())
+        # Paths `is_writable` answers `False` for, regardless of whether they
+        # exist -- a test's way of putting a destination or a directory into
+        # the same "cannot be written to" condition `make_unwritable` puts a
+        # real one into, without a real filesystem to apply a permission bit
+        # against.
+        self.unwritable: set[Path] = set(unwritable or ())
+        # Paths `owned_by_current_user` answers `False` for -- a test's way
+        # of putting a destination into the same "belongs to someone else"
+        # condition a real file owned by another uid is in, without a real
+        # filesystem to apply a different uid against. A path both here and
+        # in `files`/`directories` is exactly "exists, but is not mine";
+        # absent from both collapses to `False` too, matching the port's own
+        # contract for a path that does not exist.
+        self.unowned: set[Path] = set(unowned or ())
+        self.writes: list[Path] = []
+        self.removals: list[Path] = []
+
+    # --- Reading ---
+
+    def exists(self, path: Path) -> bool:
+        if path in self.fail_exists:
+            raise FileSystemError(f"refusing to tell whether {path} exists: injected failure")
+        return path in self.files or path in self.directories
+
+    def is_symlink(self, path: Path) -> bool:
+        if path in self.fail_is_symlink:
+            raise FileSystemError(f"refusing to tell whether {path} is a symlink: injected failure")
+        return path in self.symlinks
+
+    def resolves_to_directory(self, path: Path) -> bool:
+        if path in self.symlinks:
+            return path in self.symlinked_directories
+        return path in self.directories
+
+    def read_bytes(self, path: Path) -> bytes:
+        if path in self.fail_read:
+            raise FileSystemError(f"refusing to read {path}: injected failure")
+        if path not in self.files:
+            raise FileSystemError(f"no such file: {path}")
+        return self.files[path]
+
+    def mode_of(self, path: Path) -> int | None:
+        if path in self.fail_mode:
+            # The port distinguishes "absent" from "there but its bits could
+            # not be read", and a double that can only express the first
+            # proves the callers against a contract the real filesystem no
+            # longer has.
+            raise FileSystemError(f"refusing to read the mode of {path}: injected failure")
+        if path in self.files:
+            return self.modes.get(path, DEFAULT_MODE)
+        if path in self.directories:
+            return self.directory_modes.get(path, DEFAULT_DIR_MODE)
+        return None
+
+    def list_dir(self, path: Path) -> list[str]:
+        if path in self.fail_list:
+            raise FileSystemError(f"refusing to list {path}: injected failure")
+        if path in self.files:
+            raise FileSystemError(f"not a directory: {path}")
+        names = {
+            candidate.relative_to(path).parts[0]
+            for candidate in (*self.files, *self.directories)
+            if candidate != path and path in candidate.parents
+        }
+        return sorted(names)
+
+    # --- Locating ---
+
+    def data_dir(self, home: Path) -> Path:
+        return home / ".local" / "share" / "hpl"
+
+    def bin_dir(self, home: Path) -> Path:
+        return home / ".local" / "bin"
+
+    # --- Permissions ---
+
+    def mode_for(self, *, executable: bool) -> int:
+        return EXECUTABLE_MODE if executable else DEFAULT_MODE
+
+    def is_writable(self, path: Path) -> bool:
+        return path not in self.unwritable
+
+    def owned_by_current_user(self, path: Path) -> bool:
+        if path not in self.files and path not in self.directories:
+            return False
+        return path not in self.unowned
+
+    def mode_ensuring_executable(self, mode: int) -> int:
+        if mode & _OWNER_EXECUTE_BIT:
+            return mode
+        return mode | _OWNER_EXECUTE_BIT
+
+    # --- Writing ---
+
+    def write_atomic(self, path: Path, content: bytes, *, mode: int = DEFAULT_MODE) -> None:
+        self.make_dir(path.parent)
+        if path in self.fail_always:
+            raise FileSystemError(f"refusing to write {path}: injected permanent failure")
+        if path in self.fail_on:
+            # One shot, like a transient disk error: the retry that puts the
+            # previous content back must be allowed to succeed.
+            self.fail_on.discard(path)
+            raise FileSystemError(f"refusing to write {path}: injected failure")
+        self.files[path] = content
+        self.modes[path] = mode
+        self.writes.append(path)
+
+    def remove(self, path: Path) -> None:
+        if path in self.fail_remove:
+            raise FileSystemError(f"refusing to remove {path}: injected failure")
+        self.files.pop(path, None)
+        self.modes.pop(path, None)
+        self.removals.append(path)
+
+    def remove_dir(self, path: Path) -> None:
+        if path in self.fail_remove_dir:
+            raise FileSystemError(f"refusing to remove {path}: injected failure")
+        if path in self.files:
+            # The real one calls rmtree, which raises on a file. Deleting it
+            # here instead would let a caller aimed at the wrong kind of path
+            # pass its tests and destroy data in production.
+            raise FileSystemError(f"cannot remove {path}: not a directory")
+        for candidate in list(self.files):
+            if candidate == path or path in candidate.parents:
+                self.files.pop(candidate, None)
+                self.modes.pop(candidate, None)
+        for candidate in list(self.directories):
+            if candidate == path or path in candidate.parents:
+                self.directories.discard(candidate)
+                self.directory_modes.pop(candidate, None)
+        self.removals.append(path)
+
+    def remove_empty_dir(self, path: Path) -> bool:
+        if path in self.fail_remove_empty_dir:
+            raise FileSystemError(f"refusing to remove {path}: injected failure")
+        if path in self.files or path in self.symlinks:
+            # The real one calls `os.rmdir`, which raises `ENOTDIR` on
+            # anything but a directory -- a symlink included, even one that
+            # points at a directory, because `rmdir` never follows one.
+            # Answering `False` here instead would let a caller aimed at the
+            # wrong kind of path treat a bug as the normal "not empty yet"
+            # stopping point.
+            raise FileSystemError(f"cannot remove {path}: not a directory")
+        has_something_inside = any(
+            candidate != path and path in candidate.parents for candidate in (*self.files, *self.directories)
+        )
+        if has_something_inside:
+            return False
+        if path not in self.directories:
+            return True
+        self.directories.discard(path)
+        self.directory_modes.pop(path, None)
+        self.removals.append(path)
+        return True
+
+    def make_dir(self, path: Path, *, mode: int = 0o755) -> tuple[Path, ...]:
+        # Additive, like the real filesystem: a directory that already exists
+        # keeps whatever mode it has. The mode argument only ever applies to
+        # the leaf this call creates; any missing parents created along the
+        # way get the default mode, never the one that was requested.
+        if path in self.directories:
+            return ()
+        created: list[Path] = []
+        for ancestor in reversed(path.parents):
+            if ancestor not in self.directories:
+                self.directories.add(ancestor)
+                self.directory_modes[ancestor] = DEFAULT_DIR_MODE
+                created.append(ancestor)
+        self.directories.add(path)
+        self.directory_modes[path] = mode
+        created.append(path)
+        return tuple(created)
+
+    # --- Who is running ---
+
+    def writable_on_behalf_of_owner(self, home: Path) -> bool:
+        return self.writable

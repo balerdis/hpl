@@ -1,0 +1,358 @@
+"""`doctor --start-mcp-servers`: launching each configured server for real.
+
+`DoctorTest` in `test_cli.py` already proves `doctor` reads only; this file
+is just the flag that changes that. Branch coverage (remote skipped,
+malformed entry, handshake outcomes) uses `FakeMCPProcess`; one test uses
+the real `SubprocessMCPProcess` against the fixture server, to prove the
+wiring launches a real process and not just a double.
+"""
+from __future__ import annotations
+
+import io
+import json
+import sys
+from dataclasses import replace
+from pathlib import Path
+
+from fakes import FakeMCPProcess
+from hpl import cli
+from hpl.adapters import available
+from hpl.core import journal as journal_module
+from hpl.core import mcp_handshake, ownership
+from hpl.core.types import Environment
+from hpl.infra.mcp_process_subprocess import SubprocessMCPProcess
+from hpl.ports.mcp_process import MCPExchange
+from real_home import RealHomeTestCase as _RealHomeTestCase
+
+AT = "2026-08-14T00:00:00+00:00"
+# Pinned to OpenCode, not "whichever adapter is registered first": this
+# suite exercises capabilities (mcp, per_agent_model, subagents declared
+# inside the settings file, ...) that only OpenCode declares today. Since
+# Claude Code registered, "available().ids()[0]" resolves alphabetically
+# to "claudecode" instead, which cannot support what this file tests.
+CLI = "opencode"
+FIXTURE = Path(__file__).resolve().parent / "fixtures" / "mcp_servers" / "fixture_server.py"
+
+
+class RealHomeTestCase(_RealHomeTestCase):
+    """The real `PosixFileSystem`, against a throwaway home -- the same
+    discipline `test_cli.py` holds every CLI surface test to."""
+
+    def runtime(self, *, mcp_process=None, timeout_seconds: float = 5) -> cli.Runtime:
+        return cli.Runtime(
+            filesystem=self.filesystem,
+            home=self.home,
+            now=AT,
+            out=io.StringIO(),
+            variables={"PATH": ""},
+            mcp_process=mcp_process or FakeMCPProcess(),
+            mcp_handshake_timeout_seconds=timeout_seconds,
+        )
+
+    def layout(self):
+        return available().get(CLI).layout(Environment(home=self.home))
+
+    def present(self) -> None:
+        self.layout().config_dir.mkdir(parents=True, exist_ok=True)
+
+    def store(self):
+        return cli.journal_store(self.runtime())
+
+
+class DoctorStartMcpServersTest(RealHomeTestCase):
+    def run_doctor(self, *, mcp_process=None, timeout_seconds: float = 5, start: bool = True) -> dict:
+        context = self.runtime(mcp_process=mcp_process, timeout_seconds=timeout_seconds)
+        argv = ["doctor", "--json"] + (["--start-mcp-servers"] if start else [])
+        code = cli.main(argv, runtime=context)
+        self.assertEqual(code, cli.OK)
+        return json.loads(context.out.getvalue())
+
+    def install(self) -> None:
+        self.present()
+        code = cli.main(["install", "--cli", CLI, "--json"], runtime=self.runtime())
+        self.assertEqual(code, cli.OK)
+
+    def claim_mcp_entry(self, name: str, value: dict) -> None:
+        """The same shape `install --mcp` itself would leave: a value at
+        `/mcp/<name>` in the config, claimed in the journal."""
+        from hpl.core import codecs, pointer
+        from hpl.core.types import Codec
+
+        layout = self.layout()
+        document = codecs.loads(Codec.JSON, layout.settings_file.read_text(encoding="utf-8"))
+        document = pointer.set_at(document, f"/mcp/{name}", value)
+        layout.settings_file.write_text(codecs.dumps(Codec.JSON, document), encoding="utf-8")
+
+        store = self.store()
+        journal = store.load()
+        install = journal_module.install_for(journal, CLI)
+        claimed = journal_module.Record(
+            id=f"mcp:{name}",
+            kind="config-key",
+            target=layout.settings_file,
+            after_digest=ownership.digest_of_value(value),
+            created_at=AT,
+            pointer=f"/mcp/{name}",
+        )
+        grown = replace(install, entries=(*install.entries, claimed))
+        store.save(journal_module.with_install(journal, grown))
+
+    def entry(self, report: dict) -> dict:
+        return next(item for item in report["clis"] if item["cli"] == CLI)
+
+    def test_the_flag_is_off_by_default(self):
+        self.install()
+        report = self.run_doctor(start=False)
+        self.assertNotIn("mcp_servers", self.entry(report))
+
+    def test_no_servers_configured_reports_an_empty_list(self):
+        self.install()
+        report = self.run_doctor()
+        self.assertEqual(self.entry(report)["mcp_servers"], [])
+
+    def test_bound_servers_are_reported_without_the_flag_that_starts_nothing(self):
+        """The flag authorises running processes; this reads a journal.
+
+        Gating a pure read behind `--start-mcp-servers` left a plain `doctor`
+        silent about the servers an install granted, which is the same blind
+        spot that flag's own report was fixed to remove — only for the
+        invocation almost everyone actually types. It goes in a key of its own
+        rather than into `mcp_servers`, which is documented as the result of
+        launching things and would then hold entries nothing launched.
+        """
+        self.present()
+        code = cli.main(
+            ["install", "--cli", CLI, "--mcp", "cbm=codebase-memory-mcp", "--json"], runtime=self.runtime()
+        )
+        self.assertEqual(code, cli.OK)
+        entry = self.entry(self.run_doctor(start=False))
+        self.assertNotIn("mcp_servers", entry, "the launching report still belongs to the flag")
+        self.assertEqual([check["id"] for check in entry["mcp_bound"]], ["cbm"])
+
+    def test_an_install_with_nothing_bound_reports_an_empty_list(self):
+        self.install()
+        self.assertEqual(self.entry(self.run_doctor(start=False))["mcp_bound"], [])
+
+    def test_the_prose_report_names_them(self):
+        self.present()
+        code = cli.main(
+            ["install", "--cli", CLI, "--mcp", "cbm=codebase-memory-mcp", "--json"], runtime=self.runtime()
+        )
+        self.assertEqual(code, cli.OK)
+        context = self.runtime()
+        cli.main(["doctor"], runtime=context)
+        self.assertIn("cbm", context.out.getvalue())
+
+    def test_a_bound_server_is_named_rather_than_passed_over_in_silence(self):
+        """A bound server writes no `/mcp/<id>` key, only its convention.
+
+        `_mcp_entries` looks for the key, so a bound server is invisible to
+        this check — and an install whose only servers are bound reports "No
+        MCP servers configured", which is not a gap in the report but a false
+        statement about the machine. What can honestly be said is that the
+        server has no configuration of its own here. The key it was bound to
+        *is* now recorded, on `Install.mcp_bindings`, and reported here — the
+        one thing that was never claimed before is exactly what the test below
+        pins.
+        """
+        self.present()
+        code = cli.main(
+            ["install", "--cli", CLI, "--mcp", "cbm=codebase-memory-mcp", "--json"], runtime=self.runtime()
+        )
+        self.assertEqual(code, cli.OK)
+        entry = self.entry(self.run_doctor())
+        self.assertEqual([check["id"] for check in entry["mcp_bound"]], ["cbm"])
+        self.assertEqual(entry["mcp_bound"][0]["status"], "bound")
+        self.assertIn("no configuration of its own", entry["mcp_bound"][0]["detail"])
+        self.assertEqual(entry["mcp_servers"], [], "launching produced nothing, so it lists nothing")
+
+    def test_the_recorded_key_is_reported_in_the_json(self):
+        """The whole point of this change: the key the server was bound to
+        is now a recorded fact, not something the user has to recover by
+        reading their own configuration file by hand."""
+        self.present()
+        code = cli.main(
+            ["install", "--cli", CLI, "--mcp", "cbm=codebase-memory-mcp", "--json"], runtime=self.runtime()
+        )
+        self.assertEqual(code, cli.OK)
+        entry = self.entry(self.run_doctor())
+        self.assertEqual(entry["mcp_bound"][0]["key"], "codebase-memory-mcp")
+
+    def test_a_recorded_key_makes_the_prose_line_name_it(self):
+        self.present()
+        code = cli.main(
+            ["install", "--cli", CLI, "--mcp", "cbm=codebase-memory-mcp", "--json"], runtime=self.runtime()
+        )
+        self.assertEqual(code, cli.OK)
+        context = self.runtime()
+        cli.main(["doctor"], runtime=context)
+        output = context.out.getvalue()
+        self.assertIn("cbm", output)
+        self.assertIn("codebase-memory-mcp", output)
+
+    def test_a_recorded_key_is_positive_evidence_of_a_completed_binding(self):
+        """A present key can only have been written by `select_mcp` recording
+        a real `--mcp id=key` choice at install time -- nothing else in this
+        codebase ever writes `mcp_bindings`. So once the key is known, the
+        ambiguity with an uninstall that stopped between kinds no longer
+        applies, and the report may say so plainly instead of hedging."""
+        self.present()
+        code = cli.main(
+            ["install", "--cli", CLI, "--mcp", "cbm=codebase-memory-mcp", "--json"], runtime=self.runtime()
+        )
+        self.assertEqual(code, cli.OK)
+        detail = self.entry(self.run_doctor())["mcp_bound"][0]["detail"]
+        self.assertNotIn("did not finish", detail)
+        self.assertIn("codebase-memory-mcp", detail)
+
+    def test_a_convention_left_by_an_unfinished_uninstall_is_not_claimed_as_bound(self):
+        """The same journal shape has two causes, and only one is a binding.
+
+        `retire` walks kinds in sorted order — `config-key` before `file` — so
+        an uninstall that removed the configuration key and then failed on the
+        convention file leaves the journal holding the convention and not the
+        key: exactly what a binding leaves. Nothing in the journal separates
+        the two by itself, so the report may not claim a binding for a
+        convention entry with no recorded key. It says what is actually known
+        — that the server has no configuration of its own here — and names
+        both readings. Simulated directly, since a real install now always
+        records the key alongside the convention it places.
+        """
+        self.present()
+        code = cli.main(
+            ["install", "--cli", CLI, "--mcp", "cbm=codebase-memory-mcp", "--json"], runtime=self.runtime()
+        )
+        self.assertEqual(code, cli.OK)
+        store = self.store()
+        journal = store.load()
+        install = journal_module.install_for(journal, CLI)
+        store.save(journal_module.with_install(journal, replace(install, mcp_bindings={})))
+        detail = self.entry(self.run_doctor())["mcp_bound"][0]["detail"]
+        self.assertIn("no configuration of its own", detail)
+        self.assertIn("did not finish", detail)
+
+    def test_an_install_from_before_bindings_were_recorded_still_reports_the_hedge(self):
+        """A journal written by an earlier HPL has no `mcp_bindings` at
+        all. `doctor` must degrade to exactly today's wording -- never an
+        invented key, never a crash."""
+        self.present()
+        code = cli.main(
+            ["install", "--cli", CLI, "--mcp", "cbm=codebase-memory-mcp", "--json"], runtime=self.runtime()
+        )
+        self.assertEqual(code, cli.OK)
+        store = self.store()
+        journal = store.load()
+        install = journal_module.install_for(journal, CLI)
+        store.save(journal_module.with_install(journal, replace(install, mcp_bindings={})))
+        entry = self.entry(self.run_doctor())
+        self.assertIsNone(entry["mcp_bound"][0]["key"])
+        self.assertIn("no configuration of its own", entry["mcp_bound"][0]["detail"])
+        self.assertIn("did not finish", entry["mcp_bound"][0]["detail"])
+
+    def test_an_unknown_key_tells_the_user_how_to_find_out(self):
+        """`doctor` cannot recover a key it never recorded, but it can say
+        exactly how the person finds one out: the `install` invocation that
+        would (re)record it, built from the ids actually affected."""
+        self.present()
+        code = cli.main(
+            ["install", "--cli", CLI, "--mcp", "cbm=codebase-memory-mcp", "--json"], runtime=self.runtime()
+        )
+        self.assertEqual(code, cli.OK)
+        store = self.store()
+        journal = store.load()
+        install = journal_module.install_for(journal, CLI)
+        store.save(journal_module.with_install(journal, replace(install, mcp_bindings={})))
+
+        entry = self.entry(self.run_doctor())
+        self.assertEqual(entry["mcp_bound_unknown_keys"]["ids"], ["cbm"])
+        self.assertEqual(
+            entry["mcp_bound_unknown_keys"]["command"],
+            f"hpl install --cli {CLI} --mcp cbm=<key>",
+        )
+
+        context = self.runtime()
+        cli.main(["doctor"], runtime=context)
+        self.assertIn(f"hpl install --cli {CLI} --mcp cbm=<key>", context.out.getvalue())
+        self.assertIn("CLI's own configuration", context.out.getvalue())
+        # Copied verbatim, `<key>` typed literally bounces off
+        # `parse_mcp_choice`'s cryptic rejection -- the same explicit
+        # instruction `update`'s own refusal gives, from the same source,
+        # must appear here too.
+        self.assertIn(cli.mcp_placeholder_instruction(), context.out.getvalue())
+
+    def test_nothing_extra_is_said_once_every_key_is_known(self):
+        self.present()
+        code = cli.main(
+            ["install", "--cli", CLI, "--mcp", "cbm=codebase-memory-mcp", "--json"], runtime=self.runtime()
+        )
+        self.assertEqual(code, cli.OK)
+        entry = self.entry(self.run_doctor())
+        self.assertNotIn("mcp_bound_unknown_keys", entry)
+
+    def test_a_bound_and_a_configured_server_are_both_reported(self):
+        """One of each, so neither path hides the other."""
+        self.present()
+        code = cli.main(
+            ["install", "--cli", CLI, "--mcp", "cbm=codebase-memory-mcp", "--json"], runtime=self.runtime()
+        )
+        self.assertEqual(code, cli.OK)
+        self.claim_mcp_entry("context7", {"type": "remote", "url": "https://example.invalid", "enabled": True})
+        entry = self.entry(self.run_doctor())
+        self.assertEqual({c["id"]: c["status"] for c in entry["mcp_servers"]}, {"context7": "remote"})
+        self.assertEqual({c["id"]: c["status"] for c in entry["mcp_bound"]}, {"cbm": "bound"})
+
+    def test_a_remote_server_is_reported_but_never_launched(self):
+        self.install()
+        self.claim_mcp_entry("context7", {"type": "remote", "url": "https://example.invalid", "enabled": True})
+        report = self.run_doctor()
+        [check] = self.entry(report)["mcp_servers"]
+        self.assertEqual(check["status"], "remote")
+
+    def test_a_malformed_local_entry_is_reported_invalid(self):
+        self.install()
+        self.claim_mcp_entry("broken", {"type": "local", "enabled": True})
+        report = self.run_doctor()
+        [check] = self.entry(report)["mcp_servers"]
+        self.assertEqual(check["status"], "invalid")
+
+    def test_a_correct_handshake_is_reported_ok(self):
+        self.install()
+        command = ["fake-server"]
+        self.claim_mcp_entry("engram", {"type": "local", "command": command, "enabled": True})
+        line = (
+            '{"jsonrpc": "2.0", "id": 1, "result": '
+            '{"protocolVersion": "2024-11-05", "serverInfo": {"name": "x", "version": "1"}}}'
+        )
+        process = FakeMCPProcess(
+            exchanges={tuple(command): MCPExchange(line=line, exit_code=0, timed_out=False, spawn_error=None)}
+        )
+        report = self.run_doctor(mcp_process=process)
+        [check] = self.entry(report)["mcp_servers"]
+        self.assertEqual(check["status"], "ok")
+        self.assertEqual(check["id"], "engram")
+
+    def test_a_spawn_error_never_leaks_the_environment_into_the_report(self):
+        self.install()
+        command = ["fake-server"]
+        self.claim_mcp_entry("engram", {"type": "local", "command": command, "enabled": True})
+        secret = "sk-super-secret-token"
+        process = FakeMCPProcess(
+            exchanges={
+                tuple(command): MCPExchange(
+                    line=None, exit_code=None, timed_out=False, spawn_error="No such file or directory"
+                )
+            }
+        )
+        context = self.runtime(mcp_process=process)
+        context = replace(context, variables={**context.variables, "SOME_MCP_TOKEN": secret})
+        code = cli.main(["doctor", "--json", "--start-mcp-servers"], runtime=context)
+        self.assertEqual(code, cli.OK)
+        self.assertNotIn(secret, context.out.getvalue())
+
+    def test_the_wiring_launches_a_real_process_not_only_a_double(self):
+        self.install()
+        command = [sys.executable, str(FIXTURE), "ok"]
+        self.claim_mcp_entry("engram", {"type": "local", "command": command, "enabled": True})
+        report = self.run_doctor(mcp_process=SubprocessMCPProcess())
+        [check] = self.entry(report)["mcp_servers"]
+        self.assertEqual(check["status"], mcp_handshake.STATUS_OK)

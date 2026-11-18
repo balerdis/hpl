@@ -1,0 +1,283 @@
+# Manual de uso: HPL + OpenCode
+
+Este manual describe cómo usar HPL 7 una vez instalado: qué decide, qué preserva de tu cuenta y cómo se trabaja el día a día con OpenCode. Para instalarlo no hay procedimiento acá — está en [INSTALL.md](INSTALL.md) (manual) y en [INSTALL_BY_AGENT.md](INSTALL_BY_AGENT.md) (asistido por un agente). Si tu CLI es Claude Code, el manual equivalente es [MANUAL-claude-code.md](MANUAL-claude-code.md).
+
+## Qué es HPL en esta versión
+
+HPL 7 es un solo archivo ejecutable: un `zipapp` de Python con shebang y bit ejecutable, que se instala en `~/.local/bin/hpl` y no depende de nada instalado antes que él — el paquete no declara ninguna dependencia de terceros, así que no hay entorno privado que armar ni que mantener. `hpl` sin argumentos abre una TUI cuando corre en una terminal; sin terminal, o con un subcomando explícito, se comporta como CLI. Ambas superficies llaman al mismo motor: nada que la TUI pueda hacer le está vedado a los flags. La versión mayor que nombra este párrafo no se retipea acá: la deriva del árbol `ManualNamesTheEntryPointThisReleaseShipsTest` (`tests/test_manual_figures.py`), que además comprueba contra el árbol el destino del binario y que no haya quedado ninguna dependencia que aislar.
+
+Antes de usarlo necesitás OpenCode ya instalado en la cuenta: el binario `hpl` no lo instala, actualiza ni desinstala — sólo se integra con una instalación existente, y si no la encuentra se niega antes de escribir nada. Quien sí lo instala es `install.sh`, el script que corre el comando de una sola línea con el que empieza [INSTALL.md](INSTALL.md): trae Node y OpenCode antes de llegar al binario, así que si instalaste por ahí eso ya está resuelto, y qué hace exactamente está en [su propia sección](INSTALL.md#1-qué-hace-installsh). También hace falta una cuenta Linux no-root, porque HPL escribe únicamente en tu propio `~/.config` y `~/.local`. Las dos mitades se corren en vez de afirmarse: `ManualSaysWhoInstallsOpenCodeTest` (`tests/test_manual_prerequisites.py`) le pide un `install` a una máquina sin OpenCode y le pide su plan al script contra un home descartable, y exige que esta línea nombre todo lo que ese plan trae.
+
+## Usar la interfaz interactiva de HPL (la TUI)
+
+Correr `hpl` sin ningún subcomando, en una terminal, abre un menú — no imprime ayuda ni corre
+nada por sí solo. Es el camino pensado para una persona que está preparando su propia máquina y quiere
+ver qué va a pasar antes de que pase: cada pantalla de selección va seguida de una vista previa del
+plan, y recién al confirmar esa vista previa se escribe algo de verdad. Nada se instala por elegirlo
+en el menú; se instala al confirmar la pantalla de resultado de esa elección.
+
+El menú principal agrupa sus ocho entradas por intención, y el orden es a propósito: `Install`,
+`Update` y `Upgrade` primero (instalar y mantenerse al día), después `Configure models` y
+`Grant MCP servers`, después `Status and diagnostics`, y por último `Uninstall` antes de `Exit`
+— la entrada destructiva queda lejos de donde la navegación con flechas la podría tocar por
+accidente.
+
+Se maneja enteramente con el teclado: flechas o `j`/`k` para moverte, `enter` o `espacio` para elegir
+(en la pantalla de selección de MCPs, cualquiera de los dos tilda o destilda un servidor), `d` para
+borrar donde aplica, `esc` para volver a la pantalla anterior, `q` para salir. Si corrés `hpl` sin
+una terminal atrás (salida redirigida a un archivo o a una tubería), no hay menú que mostrar: imprime
+la misma línea de uso que `hpl --help` y termina con código de salida distinto de cero — por eso
+un agente nunca debería invocarlo así (ver [INSTALL_BY_AGENT.md](INSTALL_BY_AGENT.md)).
+
+Un mensaje largo — una nota, la prosa de un resultado, el aviso de arriba del menú — se ajusta a lo ancho de la ventana en vez de cortarse a la mitad; sólo se parte una palabra sola cuando ella misma es más ancha que la ventana. Una fila de una lista (un ítem de menú, un servidor MCP, un modelo) nunca se ajusta así: sigue siendo una sola línea, para no romper la cuenta de "N más arriba/abajo" de una lista larga. `Configure models` ofrece cada CLI detectada; la que no tiene catálogo de modelos propio (hoy, Claude Code) aparece igual en la lista, marcada `disabled` con el motivo al lado, en la misma fila.
+
+Al abrir el menú pueden aparecer, arriba de todo, hasta dos avisos independientes — separados a
+propósito, porque cada uno se arregla distinto: uno local (esta instalación se hizo con una versión de
+HPL más vieja que la que estás corriendo ahora → `Update`), y uno remoto (hay un release más nuevo
+publicado que el binario que estás corriendo → `Upgrade`). El chequeo remoto corre en segundo plano,
+no bloquea el menú, y falla en silencio ante cualquier problema de red.
+
+Durante una instalación, la TUI muestra una barra de progreso con la unidad que se está procesando; al
+terminar con éxito, la pantalla de resultado remata con un banner "HPL". Por debajo es la
+misma instalación — llama al mismo motor que usar `hpl` por línea de comandos — así que
+nada de lo que sigue deja de aplicar si preferís este camino.
+
+## Usar `hpl` por línea de comandos
+
+Además de la TUI, `hpl` se usa por línea de comandos: cada comando toma flags explícitas, no hay
+menú ni pantalla de espera, `--dry-run` te muestra el plan sin escribir nada, `--json` te da un reporte
+que podés parsear en vez de prosa, y el código de salida es el contrato — `0` para éxito, distinto de
+cero para cualquier otra cosa. Es la forma pensada para scripts, para reproducir la misma instalación
+en varias máquinas, y para cualquiera que prefiera no abrir un menú. El resto de este manual describe,
+comando por comando, lo que sigue.
+
+## Instalar el payload en OpenCode
+
+Con `hpl` en el PATH, el comando que aplica el payload es:
+
+```sh
+hpl install --cli opencode --dry-run --mcp <id>
+```
+
+`--dry-run` muestra el plan sin escribir nada; repetir el mismo comando sin ese flag lo aplica. Un servidor MCP no nombrado con `--mcp` no se instala — cada `install` nombra su selección entera. Podés repetir `--mcp` para pedir varios. Eso vale tal cual para la primera instalación; después no: un `install` a secas sobre una instalación que ya tiene una selección registrada se rechaza antes de escribir nada, en vez de retirarla en silencio porque nadie repitió el flag. Para dejar esa selección como está, usá `hpl update --cli opencode`; para revocarla a propósito, `--mcp none`. Las tres cosas —el rechazo, que no escriba nada al rechazar, y que la revocación deliberada vacíe de verdad la selección— las corre contra una instalación real `ManualSaysHowAnMcpSelectionIsRevokedOnPurposeTest` (`tests/test_manual_command_surface.py`).
+
+Cada `--mcp` acepta dos grafías, y no piden lo mismo: `--mcp <id>` le pide a HPL que obtenga y administre ese servidor, y `--mcp <id>=<clave>` le pide sólo el contrato —la convención y los permisos— contra un servidor que tu instalación ya corre bajo esa clave, sin descargar ni configurar nada para ese id. Cómo se pasa de una a la otra, y qué pasa si esa clave choca con una que ya otorgaste, está en [Dar acceso a un MCP que vos mismo administrás](#dar-acceso-a-un-mcp-que-vos-mismo-administrás). Qué hace cada grafía con la instalación no se afirma acá: las corre contra una real `ManualSaysWhatTheTwoMcpSpellingsAskForTest` (`tests/test_manual_command_surface.py`), comparando qué queda configurado y qué permiso lleva cada agente.
+
+Si el plan encuentra una clave o un archivo tuyo en el destino, lo informa y lo preserva: no lo adopta como si fuera de HPL. El payload de OpenCode queda bajo `~/.config/opencode/` (o el `XDG_CONFIG_HOME` que tengas seteado): las skills en `skills/`, los comandos en `commands/`, el system prompt de HPL como `hpl-AGENTS.md` (el nombre lleva el prefijo del binario instalado, `hpl` en esta distribución; otra distribución del mismo motor lo instala con su propio nombre), y los agentes declarados dentro de `opencode.json` — OpenCode no los materializa como archivos aparte. Después de un apply exitoso, cerrá y reiniciá OpenCode para que cargue la configuración nueva.
+
+## Si Pegasus o DARQ ya están instalados en tu usuario
+
+HPL es una evolución de Pegasus, y DARQ es otro producto de la misma familia. Los tres escriben los mismos nombres en la misma configuración de OpenCode y de Claude Code, así que no pueden convivir en un mismo usuario de Linux. Antes de escribir nada, `hpl install` (y la instalación desde la TUI) mira si Pegasus o DARQ están instalados para tu usuario; por cada uno que lo está, dice su nombre y los CLI que ocupa, explica que hay que desinstalarlo antes de instalar HPL y no sigue. Hay dos salidas:
+
+- Desinstalarlos ahora. En una terminal, `hpl install` pregunta, nombrando lo que va a desinstalar, por ejemplo `Uninstall Pegasus and DARQ now? [y/N]`, y sólo un sí explícito sigue; en la TUI la pantalla que avisa lista cada producto instalado y ofrece `Uninstall now` y `Exit`. Para un script, `hpl install --cli opencode --uninstall-previous` da ese sí de antemano. HPL corre el desinstalador de cada producto instalado (`pegasus uninstall --cli <cli>`, `darq uninstall --cli <cli>`) por cada CLI que ocupa, en ese orden, muestra lo que imprimen, vuelve a comprobar todos, y sólo instala HPL si ninguno figura ya como instalado. Si falta el programa de alguno de los instalados (se busca en el PATH y después en `~/.local/bin`), se detiene con código distinto de cero, dice cuál falta y no corre ningún desinstalador; si algo queda instalado después, también se detiene y lo dice.
+- Instalar HPL en otro usuario de Linux de la misma máquina: cada usuario tiene su propia copia de ellos (o ninguna), así que no se cruzan. Es la salida que se recomienda cuando no querés tocar lo que ya tenés.
+
+Sin un sí, `hpl install` termina con código distinto de cero sin escribir nada, ni en el journal de HPL ni en la configuración de ningún CLI. `--dry-run`, `update`, `repair`, `doctor` y `uninstall` no hacen esta comprobación.
+
+## Qué hacen los cinco MCPs opcionales
+
+| MCP | Uso práctico | Decisión |
+| --- | --- | --- |
+| CBM (`codebase-memory-mcp`) | Buscar estructura, callers, flujos e impacto de código. | Es inteligencia de código; no prueba comportamiento. |
+| Engram | Recuperar decisiones, progreso y resúmenes entre sesiones, con el protocolo de memoria persistente. | La memoria no puede sobreescribir la evidencia actual. |
+| Playwright | Probar una frontera de navegador cuando el proyecto lo necesita. | Requiere un navegador compatible instalado por separado; HPL no lo descarga. |
+| Context7 | Consultar documentación del proveedor de forma remota. | Es remoto, igual que Jira; confirmá el acceso a esa red por separado. |
+| Jira | El tracker de tu organización, a través del servidor remoto propio de Atlassian. Qué herramientas expone lo decide Atlassian, no HPL. | Necesita una autorización única, `opencode mcp auth jira`, antes de que cualquier herramienta conteste, y nada más te lo va a avisar. No retiene ninguna herramienta: lo que ese servidor permita, un agente que lo reciba lo puede hacer — crear, transicionar y editar, no sólo leer. |
+
+Instalá solo lo que el equipo vaya a usar: un servidor no pedido con `--mcp` no deja config ni dependencia huérfana.
+
+Lo mismo se elige desde la TUI (`hpl`, sin argumentos), en el menú principal → `Install` → elegí el CLI: antes del plan aparece la pantalla `Install · <CLI> · choose which mcp servers to install`, un casillero por cada servidor que esta release embarca y una fila `Continue` al final. Gobierna una sola cosa: cuáles de esos servidores son parte de la instalación. Abre mostrando el estado real de la máquina y no una lista vacía —todo lo que el journal registra como instalado abre tildado—, y eso incluye los servidores atados: uno que HPL no obtiene sino que usás contra una clave tuya (`--mcp id=<clave>`) está instalado igual, así que abre tildado, y su fila lo dice con el prefijo `bound to <clave>` delante de la descripción. Dos casilleros idénticos que significan cosas distintas serían una trampa: uno pide «instalá y administrá este servidor» y el otro «dame el contrato contra el que ya corro bajo esta clave».
+
+Por eso continuar sin tocar nada reproduce el estado que ya tenías, en vez de retirar una parte: cada fila tildada se vuelve a emitir con la grafía con la que estaba registrada, `id=clave` para una atada y el nombre pelado para una que administra HPL. Destildar una fila es la única forma de pedir un retiro, y por eso siempre es un acto deliberado. Lo que esta pantalla no hace es cambiar quién administra un servidor: convertir uno atado en uno que HPL obtiene, o al revés, es trabajo de `Grant MCP servers` (más abajo), y acá una fila conserva su atadura la tildes o la destildes.
+
+Si destildaste algo, lo que te salva es el plan que viene después: todavía no escribió nada, y lista bajo `Would retire, no longer asked for:` exactamente lo que ese `Continue` sacaría de la máquina. Leé esa sección antes de confirmar; si aparece algo que no querías sacar, `esc` vuelve atrás sin escribir y podés volver a tildarlo. Si la instalación tiene una ligadura sin resolver (`--mcp id=<clave>` con la clave nunca registrada), la pantalla muestra ese bloqueo en lugar de la lista, por el mismo motivo que `Grant MCP servers`: con ese estado sin resolver no hay fila que pueda reproducirse bien, y hay que resolverlo primero.
+
+## Dar acceso a un MCP que vos mismo administrás
+
+HPL renderiza cada agente con una base que niega todo (`{"*": false}`) más una lista de los servidores que él mismo instala. Un MCP que instalaste y administrás por tu cuenta (Sentry, Figma, o cualquier otro) queda fuera de esa lista aunque figure en tu `opencode.json`: OpenCode combina el bloque de permisos propio del agente al final, así que si HPL no le abre la puerta a esa clave, ningún agente puede usarla, sin importar qué diga tu configuración general.
+
+Si ya administrás tu propia clave `jira` con `mcp grant` —que alcanza a **todos** los agentes que la release embarca, sin excepción y sin que el número cambie la regla: hoy son **16 agentes**— y más adelante un `install`/`update` selecciona el `jira` que HPL embarca —que sólo alcanza a los agentes que su propio descriptor nombra, hoy **11 agentes**, los mismos que llevan Context7—, la colisión no aborta nada: `grant_mcp` descarta en silencio el grant que venías arrastrando, por considerarlo redundante, y tu alcance se achica de todos los agentes a ese subconjunto sin más aviso que el `grant_warnings` del report. Las dos cifras no se retipean acá: las deriva del árbol `GrantMcpReachesEveryAgentTest` (`tests/test_manual_figures.py`), que además corre el grant de verdad para comprobar que «todos» sigue siendo todos, y falla el día que alguna deje de coincidir.
+
+`hpl mcp` es la palanca para eso. A diferencia de los MCPs que HPL instala, acá no hay elección por agente: la clave se otorga a todos los agentes por igual, porque hacerlo agente por agente volvería tediosa la tarea de sumar un MCP más.
+
+```sh
+hpl mcp grant --cli opencode sentry-mcp
+hpl mcp list --cli opencode
+hpl mcp revoke --cli opencode sentry-mcp
+```
+
+`grant` y `revoke` aceptan más de una clave en el mismo comando (`hpl mcp grant --cli opencode sentry-mcp linear figma`, no una lista separada por comas): cada clave se valida antes de otorgar nada, así que una clave mal tipeada en el medio del lote rechaza el lote entero y no otorga ni una — nunca deja la mitad otorgada. Esto es también lo que evita que asignar varias claves dispare varios renders completos y varias generaciones de snapshot por una intención que era una sola. `grant` rechaza una clave que tu propia configuración de OpenCode no declara bajo `mcp` — nombra ahí mismo cuáles sí declara, para que un error de tipeo no termine en un permiso que nadie nota que falta. `revoke` sobre una clave que nunca otorgaste no es un error: informa que ya estaba en ese estado y sale en `0`. `list` muestra lo que está otorgado ahora, y de las claves que tu configuración declara y todavía no otorgaste, cuáles `grant` aceptaría tal como está la instalación — nunca una que `grant` fuera a rechazar. Una clave declarada que HPL ya alcanza por agente (un servidor propio de esta instalación, o una clave ya ligada) se muestra aparte, marcada como ya cubierta, en vez de desaparecer del listado sin explicación. `list` no escribe nada: lee el journal y tu configuración, y deja `opencode.json` exactamente como estaba.
+
+`hpl mcp grant` y `hpl mcp revoke` reaplican la configuración renderizada al terminar — igual que `hpl install` — así que el cambio ya queda escrito en `opencode.json`. Cuál de los subcomandos escribe y cuál no, no se afirma acá de memoria: lo mide `ManualSaysWhichMcpSubcommandsRewriteTheConfigurationTest` (`tests/test_manual_command_surface.py`), corriendo cada uno contra una instalación real y comparando el archivo renderizado byte a byte de un lado y del otro de la llamada. Como con cualquier cambio a los agentes, hace falta reiniciar OpenCode para que lo lea: sigue leyendo la configuración de agentes una sola vez, al arrancar. `hpl update --cli opencode` reaplica las claves otorgadas junto con el resto de la selección, sin flags.
+
+Lo mismo está disponible desde la TUI (`hpl`, sin argumentos), en el menú principal → `Grant MCP servers` → elegí el CLI. La pantalla lista las claves que `mcp list` reporta como `available` para esa instalación, cada una tildada o no según si ya está otorgada; espacio o enter la tilda o destilda, y `Continue` aplica de una sola vez todo lo otorgado y todo lo revocado — y sólo cuenta como aplicado lo que su propio llamado efectivamente logró, nunca lo pedido sin más si algo se rechazó mientras tanto. Si no hay ningún servidor propio para mostrar, la pantalla explica cuál de dos motivos es: no instalaste ninguno todavía (instalalo en OpenCode como siempre lo harías, y volvé acá a otorgarlo), o ya instalaste uno pero HPL ya lo alcanza por agente y nombra cuál — ahí no hay nada para hacer, no es que la detección haya fallado. Si la instalación tiene una ligadura sin resolver (`--mcp id=<clave>` sin la clave nunca registrada), la pantalla lo dice en vez de listar nada: mientras eso siga así, `grant`/`revoke` se niegan para cualquier clave, no sólo la ligada, y hace falta resolverlo primero (ver más arriba). El resultado avisa el mismo reinicio que ya se menciona arriba.
+
+Si más adelante un `install` liga un servidor propio de HPL (`--mcp id=<clave>`) bajo la misma cadena que una clave que ya habías otorgado, esa clave otorgada queda redundante y el `install` la descarta en vez de fallar — el servidor sigue siendo alcanzable a través de los agentes que ahora lo declaran. El comando avisa qué clave descartó; si no era lo que querías, volvé a otorgarla con `hpl mcp grant`.
+
+## Dar acceso a un directorio de trabajo propio
+
+OpenCode pregunta por un permiso separado, `external_directory`, apenas una herramienta de archivo o `bash` apunta a algo fuera del worktree del proyecto. Cada agente que HPL instala ya trae la excepción que necesita para leer sus propias skills, pero un directorio que vos necesitás — un worktree enlazado, un árbol de scratch fuera del repo — es un dato que HPL no puede conocer de antemano, y no hay forma de agregarlo a mano: HPL reclama la entrada completa de cada agente en `opencode.json`, así que una excepción escrita a mano la pisa el próximo `install`/`update`.
+
+```sh
+hpl directory grant --cli opencode /home/vos/worktrees/otro-repo
+hpl directory revoke --cli opencode /home/vos/worktrees/otro-repo
+```
+
+`grant` acepta cualquier ruta absoluta que no sea la raíz del filesystem (`/`), no contenga un metacarácter de glob (`*`, `?`, `[`, `]`), y no sea el directorio de configuración de OpenCode, el directorio de datos propio de HPL (donde vive su journal), ni un ancestro de cualquiera de los dos. El de configuración guarda tus propios servidores; el de datos guarda el registro que `uninstall` usa para decidir qué borrar, así que darle escritura a un agente ahí equivaldría a dejarlo decidir qué se borra en la próxima desinstalación. Fuera de esas restricciones, una ruta relativa o con `..` también se rechaza; el resto se acepta, incluida una ruta fuera de tu home. La ruta se normaliza antes de guardarse (una barra final o `//` repetidas colapsan a la misma forma), así que `grant`/`revoke` con distinta grafía de la misma ruta se reconocen entre sí. `revoke` sobre una ruta que nunca otorgaste no es un error: informa que ya estaba en ese estado y sale en `0`. Igual que `mcp grant`/`mcp revoke`, los dos aceptan más de una ruta en el mismo comando (rutas repetidas, nunca separadas por comas): cada una se valida antes de otorgar o revocar nada, así que una ruta inválida en el medio del lote rechaza el lote entero, nombrándola, y no toca el disco — la alternativa, un lote a medio aplicar, dejaría la instalación en un estado que no corresponde ni a lo que había antes ni a lo que se pidió.
+
+A diferencia de un MCP propio, un directorio otorgado alcanza a **todo** agente, primario o sub-agente por igual — no hay recorte por agente que preservar, así que no hace falta. Los dos reaplican la configuración renderizada al terminar, igual que `hpl mcp grant`, así que el cambio ya queda escrito en `opencode.json` y sobrevive a cada `install`/`update` posterior sin que haga falta repetirlo. Como con cualquier cambio a los agentes, hace falta reiniciar OpenCode para que lo lea.
+
+Un directorio que otorgás no se renderiza como una pregunta. HPL renderiza `external_directory` con línea de base `"*": "allow"` — todo agente que declara una herramienta de archivo o `bash` puede salir del worktree sin que nadie apruebe nada, otorgado el directorio o no. Esta es una decisión de producto deliberada, expuesta —no motivada— por un bug abierto de OpenCode (`anomalyco/opencode#39112`): a dos niveles de sub-agente, el pedido de `external_directory` no aparece en ninguna pantalla de la TUI y la herramienta se cuelga para siempre, sin límite de tiempo, porque la vista que lista pedidos pendientes sólo mira un nivel de la sesión. Como HPL encadena sub-agentes hasta profundidad 10, esa cadena es habitual, no una rareza, así que la línea de base permite en vez de preguntar, para no colgarse nunca — a costa de no preguntar tampoco en las dos profundidades donde la pregunta sí se mostraría bien.
+
+Mientras la línea de base sea `"allow"`, el otorgamiento queda **dormido, no inútil**: el comando sigue existiendo, sigue quedando en el journal, y sigue escribiendo su propia entrada, `"/home/vos/worktrees/otro-repo/*": "allow"`, con el mismo valor que la línea de base, `"*": "allow"` — así que hoy no cambia nada que esa línea de base no cambiara ya. Eso no es motivo para revocar lo que ya otorgaste: que `#39112` se resuelva río arriba no vuelve la línea de base a `"*": "ask"` por sí solo — habilitar `external_directory` por default es una decisión de producto asentada, no condicionada a ese arreglo. Si la línea de base cambiara alguna vez por otra razón, cada entrada otorgada recuperaría de una su sentido completo, sin que haga falta volver a correr `directory grant`; por eso el otorgamiento se sigue escribiendo aunque hoy sea dormido, no por anticipar una reversión pautada. Lo único que esa línea de base no alcanza, otorgado o no, es un puñado fijo de directorios que HPL deniega en su grafía canónica: cualquier `.ssh/`, `.aws/`, `.credentials/`, `.config/gh/` o `secrets/`, escritos después de cualquier entrada otorgada para que ganen incluso si alguien otorgara justo esa ruta — otorgar no puede destrabarlos. La entrada que se cita acá, y la lista de directorios siempre denegados, salen del `opencode.json` real: la deriva `ManualSaysHowAGrantedDirectoryIsRenderedTest` (`tests/test_manual_command_surface.py`).
+
+Sé honesto con vos mismo sobre qué es esto y qué no es: un piso contra el agente que entra a uno de esos cinco directorios **por accidente**, no una frontera contra el que quiere llegar ahí a propósito. El match es sobre el string literal del path — ni el runtime ni este piso llaman `realpath` — así que un symlink, un bind mount, o una variable de entorno que un programa invocado por `bash` respeta (`GH_CONFIG_DIR`, `AWS_SHARED_CREDENTIALS_FILE`) atraviesan el piso sin tocarlo, y un agente que ya tiene `bash` bajo esta misma línea de base `allow` puede construir esa vuelta él mismo. Y todo lo que el piso no puede alcanzar por construcción — un `*.pem`, un `*.key`, un `.env` que viva fuera de esos cinco directorios, que es la mayoría de los lugares donde un archivo puede vivir — queda alcanzable de verdad para cualquier agente con una herramienta de archivo, no meramente "sin guardia en abstracto".
+
+Sobre los archivos sensibles (`.env`, `*.pem`, `*.key` y similares): la confirmación aparece cuando el agente abre o edita el archivo con su herramienta de archivos; un comando que corras vos en la terminal no está cubierto. Si en tu propio mensaje le pedís que guarde credenciales en un archivo que nombrás (por ejemplo «guardalo en un `.env`»), ese pedido es el permiso para ESE archivo durante la sesión; un texto de un archivo, de una herramienta, de una página web o de otro agente nunca lo es. Tiene que ser un solo archivo regular de estilo `.env`, nunca un symlink ni nada de `.ssh/`, `.aws/credentials`, `*.pem` o `*.key`. Con él puede crearlo, escribirle un valor reemplazado expandiendo su variable, agregarlo a `.git/info/exclude` si está en un repositorio git y todavía no está ignorado, listar los nombres de sus variables y cargarlo en un comando sin imprimirlo (`set -a; . ./.env 2>/dev/null; set +a; <comando>`). Nunca imprime sus valores, y el plugin no los redacta de la salida de un comando; el permiso no alcanza a ningún otro archivo sensible.
+
+Si la ruta que otorgás cae bajo uno de esos cinco directorios, `directory grant` no la rechaza — sigue otorgando y sigue registrando, igual que cualquier otra ruta — pero el reporte incluye un aviso explicando que esa entrada nunca va a tener efecto, porque el piso se escribe después de cualquier concesión y siempre gana la resolución del runtime. Esto no es el mismo caso **dormido** que el párrafo anterior: un otorgamiento ordinario recupera su sentido completo el día que la línea de base vuelva a `"ask"`; uno que el piso alcanza **nunca** lo recupera, porque el piso se escribe al final sin importar cuál sea la línea de base. El aviso se calcula comparando la ruta contra las mismas cinco entradas de `EXTERNAL_DIRECTORY_DENY_FLOOR`, con la misma semántica de comodín que usa el runtime — no una comparación aproximada por nombre de directorio.
+
+### Lo mismo en Claude Code
+
+Claude Code no tiene un permiso separado llamado `external_directory`: lee o escribe fuera del directorio de trabajo según sus propias reglas `permissions.allow`/`permissions.deny` en `settings.json`. La misma decisión de producto por la que OpenCode abre por default se toma acá también, y de la misma forma: `permissions.allow` trae `Read(//**)` y `Edit(//**)` (el `//` inicial ancla el patrón en la raíz del filesystem, no en el directorio de trabajo; `Edit` alcanza también al Write, que no tiene regla propia), así que cualquier agente puede leer y escribir fuera del worktree sin que nadie apruebe nada, sin necesidad de otorgar nada antes. Después de esas reglas, `permissions.deny` trae dos entradas por cada uno de los mismos cinco directorios siempre denegados — `Read(//**/<directorio>/**)` y `Edit(//**/<directorio>/**)` — que ganan la resolución del runtime igual que en OpenCode. Instalar, actualizar y desinstalar tratan cada una de esas reglas como una entrada propia agregada a la lista de la persona, nunca como dueño de la lista entera: lo que ya tenías en `permissions.allow`/`deny` antes de instalar, o lo que agregues a mano después, se conserva intacto.
+
+`hpl directory grant --cli claudecode <ruta>` y su `revoke` existen y funcionan igual que en OpenCode — validan la ruta, la registran en el journal, sobreviven a cada reinstalación — pero quedan **dormidos**, no inútiles: como el default ya es permitir todo directorio externo fuera del piso, no hay una regla por directorio que otorgar acá tenga sentido de escribir, y el comando no renderiza nada nuevo en `settings.json`. El reporte lo dice así, sin reclamar un efecto que el comando no tiene: informa que la ruta quedó registrada y que hoy no cambia nada, porque los directorios externos ya están permitidos por default fuera del piso siempre denegado.
+
+## Usarlo todos los días
+
+1. Abrí OpenCode dentro del repositorio en el que vas a trabajar.
+2. Pedí lo que necesitás con tus palabras. El orquestador elige la ruta: una consulta se responde sin tocar nada, un cambio trivial y ya entendido se hace directo, y la mayoría de los cambios comunes van por FTD sin que tengas que pedirlo.
+3. En FTD, el agente cierra el alcance, te pide una sola confirmación antes de escribir y lleva un record en `docs/ftd/`. El FTD que crea esa carpeta te avisa una sola vez; si no querés versionarla, agregá `docs/ftd/` a `.gitignore`, o a `.git/info/exclude` si tampoco querés versionar la exclusión.
+4. SDD aparece cuando hace falta: el orquestador lo propone si hay que fijar antes del código un contrato o una decisión que va a revisar alguien que no está en la implementación, o una spec contra la que otros van a construir, y entra sólo si aceptás. También podés pedirlo vos (`sdd-init`, `sdd-new` o `sdd-ff`): completás el pre-chequeo de sesión, explore, propuesta, spec, diseño y tareas aclaran el cambio antes de `sdd-apply`, y cerrás con `sdd-verify`, la única autoridad para declarar listo para archivar un cambio SDD.
+
+Qué ruta toma cada pedido lo decide [flow-applicability.md](src/hpl/content/skills/_shared/flow-applicability.md), y cómo corre un FTD, [ftd-procedure.md](src/hpl/content/skills/_shared/ftd-procedure.md).
+
+Los comandos distribuidos son `sdd-init`, `sdd-new`, `sdd-ff`, `sdd-continue`, `sdd-apply`, `sdd-status`, `sdd-verify`, `sdd-archive`, `sdd-onboard`, `sdd-explore`, además de `context-load`, `context-save`, `handoff-load`, `handoff-save`, `skill-creator` y `skill-registry`. Podés leer su contenido en `~/.config/opencode/commands/` antes de usarlos. Cuando el registro de skills escribe `.atl/skill-registry.md` dentro de un repositorio git, HPL agrega `.atl/` a `.git/info/exclude` (nunca a `.gitignore`), para que el directorio no aparezca en `git status`.
+
+## Elegir proveedor, modelo y esfuerzo
+
+HPL distribuye roles, no credenciales ni modelos: ningún agente trae uno asignado por defecto. En el primer arranque, ejecutá `/connect` dentro de OpenCode para configurar las credenciales del proveedor, y `/models` para elegir el modelo que querés usar de forma general. Esas dos decisiones son tuyas y OpenCode las guarda en su propia configuración; HPL no las lee ni las reproduce.
+
+Para asignar un modelo puntual a un agente, HPL tiene su propio comando, separado del `/models` de OpenCode. Lo acepta **todo** agente que esta release embarca —el orquestador, `king-hpl` y los especialistas sin fase incluidos—, sin excepción y sin que el número cambie la regla: hoy son **16 agentes**. Ni la regla ni la cifra se retipean acá: las deriva del árbol `EveryShippedAgentAcceptsAModelAssignmentTest` (`tests/test_manual_figures.py`), que además le pide una asignación a cada agente embarcado para comprobar que ninguno la rechaza. Se usa así:
+
+```sh
+hpl models set --cli opencode --assign sdd-apply=anthropic/claude-sonnet-5 --effort sdd-apply=high
+hpl models list --cli opencode
+hpl models unset --cli opencode --agent sdd-apply
+```
+
+`--assign` y `--effort` se repiten, cada uno por su cuenta, para asignar varios agentes en un solo comando: `--assign sdd-apply=anthropic/claude-sonnet-5 --assign king-hpl=anthropic/claude-opus-5 --effort king-hpl=high` graba las dos asignaciones y reaplica una sola vez, en vez de correr `models set` dos veces y pagar dos renders completos y dos generaciones de snapshot por una intención que era una sola. Cada flag nombra el agente al que pertenece (`AGENT=PROVIDOR/MODELO`, `AGENT=NIVEL`) en vez de emparejarse por posición entre dos flags repetidos por separado, porque esa relación implícita no la valida `argparse` y un desalineamiento pasaría en silencio. `models unset --agent` también es repetible, para sacar varias asignaciones en un solo comando. Si un ítem del lote es inválido —un agente que esta release no ofrece, un `PROVIDOR/MODELO` mal escrito, un `--effort` para un agente que ningún `--assign` nombró—, el comando entero se rechaza, nombra cuál fue y no graba nada: ni una asignación a medias.
+
+`models set` escribe la asignación en la configuración de OpenCode en el mismo comando, y `models unset` la saca igual: no hay un segundo paso que acordarse de correr. Por eso los dos rechazan una CLI que no tenga nada instalado, con el mismo mensaje que ya dan `hpl mcp grant` y `hpl directory grant`: no hay configuración que reaplicar. Lo único que queda después es reiniciar OpenCode, que lee los prompts de los agentes una sola vez al arrancar. Si una asignación quedó guardada sin renderizar —por ejemplo, porque el proveedor no estaba disponible en el momento de guardarla—, cualquier comando que reaplique la configuración entera se la lleva con él: `hpl install --cli opencode`, `hpl update --cli opencode`, `hpl mcp grant` y `hpl directory grant`. Todo eso lo corre contra una instalación real `ManualSaysWhenAModelAssignmentReachesTheConfigurationTest` (`tests/test_manual_command_surface.py`), leyendo el archivo renderizado de un lado y del otro de cada llamado. No pongas tokens ni credenciales en el repo, en prompts, ni en comandos versionados.
+
+`models` (y sus tres subcomandos `set`/`unset`/`list`, cada uno con su propia ayuda) existe sólo para una CLI que declare catálogo de modelos propio — hoy, OpenCode; Claude Code resuelve proveedor y modelo contra su propia API en el momento, sin un catálogo local que leer, así que no lo declara. `hpl models --help` (y `hpl models set/unset/list --help`) nombra ahí mismo para cuál CLI vale: la lista sale de qué adaptador declara la capacidad, no está escrita a mano, así que una CLI que la sume o la pierda en otra release aparece o desaparece sola. En la TUI, `Configure models` ofrece cada CLI detectada; la que no declara la capacidad aparece igual en la lista, pero marcada "disabled" con el motivo al lado, en la misma fila — el motivo real ("Claude Code no tiene catálogo de modelos local; resuelve proveedor y modelo contra su propia API en el momento"), no una reformulación de la condición técnica — nunca hay que entrar a esa fila para enterarse.
+
+## Verificar el estado
+
+```sh
+hpl doctor
+```
+
+Reporta qué CLIs anfitrionas detecta y qué drift hay entre lo instalado y lo que el contenido actual generaría. No reemplaza una prueba de comportamiento.
+
+Para chequear además que cada servidor MCP instalado arranca y contesta el handshake de MCP:
+
+```sh
+hpl doctor --start-mcp-servers
+```
+
+Tiene sentido correrlo después de instalar servidores MCP, o cuando un cliente reporta que uno no conecta. A diferencia de `doctor` a secas, este flag ejecuta los comandos que la configuración tiene guardados — por eso no es el comportamiento por defecto.
+
+Por cada servidor que este flag arranca informa uno de estos estados: `ok` (contestó el handshake), `timeout` (arrancó pero nunca contestó), `exited` (terminó antes de contestar), `invalid` (contestó algo que no es una respuesta MCP válida), `not-found` (no se pudo arrancar), `unreadable` (no se pudo leer la configuración de donde sale el comando) o `missing` (esa configuración ya no tiene la entrada que el journal reclama). Un servidor configurado como remoto no se arranca y se informa `remote`. Y uno atado a una clave que administrás vos (`--mcp id=<clave>`) tampoco aparece en esa lista: se informa aparte, con estado `bound`, y eso lo dice también un `hpl doctor` sin el flag, porque no hay proceso que arrancar — es el estado normal de una instalación así, no una falla. Ninguno de esos estados se retipea acá: los deriva del árbol `ManualSaysEveryStatusDoctorCanReportTest` (`tests/test_manual_command_surface.py`), que además instala un servidor atado y uno remoto de verdad para comprobar dónde cae cada uno.
+
+`hpl repair --cli opencode` saca dos cosas que `doctor` sólo nombra, con `--dry-run` disponible para ver antes qué se va a remover: las entradas de `directories_quarantined` -- un `granted_directories` editado a mano en el journal que no pasó la validación y por eso no le concede nada a ningún agente -- y los directorios vacíos que `doctor` reporta bajo `unprunable_empty_directories`, que la poda automática nunca puede alcanzar. Toma un snapshot del journal antes de escribir, así que `hpl restore` deshace la parte del journal igual que deshace cualquier otro comando; un directorio vacío borrado no se restaura -- no hay nada que recuperar más allá de un `mkdir`. Si `doctor` reporta `directories_not_walked`, hay un subárbol detrás de un symlink que ni `doctor` ni `repair` pudieron recorrer, y `repair` lo dice en su propio reporte en vez de sugerir que ahí no queda nada.
+
+### Lo que OpenCode carga de Claude Code
+
+Si en la misma máquina tenés también Claude Code, OpenCode puede leer archivos que no son de HPL ni suyos. Está verificado en el código de OpenCode (v1.18.32):
+
+- Como instrucciones globales usa `~/.config/opencode/AGENTS.md`; si ese archivo no existe, usa `~/.claude/CLAUDE.md`, el de Claude Code. HPL no instala un `AGENTS.md` global a propósito (el suyo es `hpl-AGENTS.md`, que carga por `instructions`), así que en esa máquina el orquestador de HPL puede obedecer, sin avisar, reglas escritas para otra CLI.
+- Siempre recorre `~/.claude/skills/**/SKILL.md` y suma esas skills a las suyas. Si una skill de HPL tiene el mismo nombre que una de ellas, gana la de HPL; el resto se agrega.
+
+`hpl doctor` lo dice cuando corresponde, y `install` y `update` repiten el mismo aviso una vez: nombra el archivo, cuántas skills son y la variable de entorno que lo apaga. Sólo mira que existan y cuántas son; nunca abre su contenido. Las variables son estas:
+
+- `OPENCODE_DISABLE_CLAUDE_CODE_PROMPT=1` apaga sólo el `CLAUDE.md`.
+- `OPENCODE_DISABLE_CLAUDE_CODE_SKILLS=1` apaga sólo las skills.
+- `OPENCODE_DISABLE_CLAUDE_CODE=1` apaga las dos cosas.
+- `OPENCODE_DISABLE_EXTERNAL_SKILLS=1` también saltea ese recorrido de `~/.claude/skills`, y además el de `~/.agents/skills` y de los directorios de skills del proyecto.
+
+OpenCode lee estas variables como booleanos y distingue mayúsculas: apagan `true`, `yes`, `on`, `1` e `y`; `false`, `no`, `off`, `0` y `n` las dejan en falso; cualquier otro valor (`TRUE`, `maybe`) no es un booleano válido para OpenCode, y `doctor` lo avisa en vez de darlo por apagado o por prendido.
+
+Para dejarlo fijo, ponela en `~/.bashrc` (o el archivo equivalente de tu shell):
+
+```sh
+export OPENCODE_DISABLE_CLAUDE_CODE=1
+```
+
+El chequeo de `doctor` lee el entorno del shell donde lo corrés. Un OpenCode lanzado desde otro lado, por ejemplo desde un ícono del escritorio, puede tener otro entorno y seguir cargando esos archivos aunque `doctor` no avise: ahí la variable hay que ponerla donde esa sesión la lea (el archivo de sesión de tu escritorio, no sólo `~/.bashrc`). Apagarlo también saca cualquier regla de la que te venías sirviendo desde `CLAUDE.md`. Si querés una regla en OpenCode, ponela en tu propio `~/.config/opencode/AGENTS.md`: HPL nunca lo toca, y con ese archivo presente OpenCode deja de caer al `CLAUDE.md`.
+
+### Un MCP de npm que no conecta con Node de nvm
+
+Un servidor MCP que se instala con npm, como playwright, necesita `node` en el PATH del proceso que lanza la CLI. Con Node instalado por nvm, `node` sólo existe en los shells interactivos que cargaron nvm: una CLI abierta desde un ícono del escritorio, o desde un shell no interactivo, ve fallar a playwright aunque esté bien instalado. Se midió: en un shell no interactivo playwright falló; en un shell interactivo de login conectó. Lanzá la CLI desde un shell que haya cargado nvm, o poné el `PATH` con el `node` de nvm donde lo lea quien arranca la CLI.
+
+## Mantener HPL al día
+
+Son dos actualizaciones distintas y conviene no confundirlas: `hpl update --cli opencode` reaplica en OpenCode la selección que esa instalación ya tiene registrada, y `hpl upgrade` no toca ninguna instalación — reemplaza el binario `hpl` en sí. Para saber desde qué versión partís, `hpl -V` (o `hpl --version`) la contesta sin abrir tu home, sin leer el journal y sin resolver ningún adapter: es la versión del binario y no la de ninguna instalación suya, así que sigue contestando en una máquina donde la instalación esté rota, que es justo cuando hace falta.
+
+```sh
+hpl upgrade --dry-run
+hpl upgrade
+```
+
+No lleva `--cli` porque no se trata de ninguna instalación puntual. Se niega antes de bajar un solo byte si no está corriendo desde un ejecutable instalado, si el destino no es escribible, si el archivo que hay ahí es de otra persona, o si no llega a la red para averiguar cuál es la última versión publicada. Recién después baja el checksum y el binario, lo verifica contra ese checksum, y lo pone en su lugar con un único rename atómico: un checksum que no coincide o una escritura que falla dejan intacto el binario con el que arrancaste, así que nunca hay un momento sin un `hpl` funcionando en disco. Estar ya en la última versión publicada no es un error — lo informa y sale en `0`. Después hace falta reiniciar HPL: el proceso que acaba de hacer el upgrade sigue siendo, en memoria, la versión vieja.
+
+Lo mismo está en la TUI (`hpl`, sin argumentos), en el menú principal → `Upgrade`. Al abrir el menú, si hay un release más nuevo publicado que el binario que estás corriendo, el aviso aparece arriba de todo; ese chequeo corre en segundo plano, no bloquea el menú, y falla en silencio ante cualquier problema de red.
+
+Si `hpl upgrade` no puede leer la información de releases —el repositorio de releases no se alcanza, la red está caída o GitHub limita las consultas— lo dice en una línea con el motivo y sale con código 1 sin tocar nada; en la TUI lo mismo aparece en la pantalla de resultado. El aviso del menú, en cambio, calla. Las releases están en el repositorio público `balerdis/hpl`; si no se alcanzan, la actualización también se puede hacer desde un build local: se arma el binario con el constructor de `tools/` (el comando está en el enlace de abajo), se copia sobre `~/.local/bin/hpl` y se corre `hpl update --cli <cli>`. Los tres comandos exactos están en [`docs/release-distribution.md`](docs/release-distribution.md#actualizar-desde-un-build-local).
+
+`update` (y `install`) también limpia después de un cambio exitoso: borra de `~/.local/share/hpl/mcp/<servidor>/<versión>` las versiones viejas de los servidores MCP descargados que ya no usa ninguna instalación. Se conservan las versiones que registra cualquier instalación del journal (OpenCode y Claude Code comparten esa carpeta), las versiones fijadas y la que usaba este HPL antes del update, para que un `hpl restore` siga funcionando; esa última se borra en el update siguiente. Sólo toca carpetas `<servidor>/<versión>` de servidores que HPL administra y nunca sigue un symlink. Si no puede borrar algo, el comando no falla: lo informa. El reporte lo dice como «Removed old versions of downloaded servers nothing uses any more» (`pruned_dependencies` en `--json`), y `--dry-run` lista lo que se borraría. `uninstall` hace lo mismo y deja sólo lo que usan las instalaciones que quedan.
+
+## Deshacer
+
+- `hpl restore [generación]` vuelve al estado exacto anterior a un comando (o a una generación puntual del historial de snapshots). `hpl restore --list` muestra qué generaciones existen todavía -- número, cuándo se tomaron, qué comando las produjo y cuánto tocarían -- para elegir una sin adivinar.
+- `hpl uninstall --cli opencode` retira solo lo que el journal reclama como propio.
+
+Una consecuencia de la limpieza de `update`: restaurar una generación más vieja que un update atrás deja apuntando a un servidor descargado que ya no está, y `restore` nunca vuelve a descargar. Después de ese `restore`, corré `hpl update` para que lo baje de nuevo.
+
+El journal vive en `$XDG_DATA_HOME/hpl/journal-v4.json` (o `~/.local/share/hpl/journal-v4.json`), en un directorio `0700` con el archivo en `0600`. Lo que decide qué se toca es **el journal y nada más**: un archivo que HPL nunca creó no se toca nunca, y uno que el journal reclama se retira aunque vos lo hayas editado después. Nunca uses `restore` ni `uninstall` para borrar configuración que ya era tuya.
+
+Una edición tuya sobre un archivo que HPL instaló no sobrevive: `install` y `update` la reescriben con la versión del release, y `uninstall` la borra sin aviso equivalente al `overwritten` que sí te dan los otros dos. Lo que te recupera es `hpl restore`, con veinte generaciones de historial y no más. El motivo de esa política, los dos huecos del aviso y qué hacer en cada caso están en [docs/arquitectura/arquitectura.md#limitaciones-aceptadas](docs/arquitectura/arquitectura.md#limitaciones-aceptadas).
+
+## Pasar credenciales sin exponerlas
+
+Cuando le pegás a la sesión un valor que parece una credencial —un token al lado de una clave como `token`, `api_key`, `secret`, `password`, `client_secret` o `signature`; un header `Authorization: Bearer …`/`X-Api-Key: …`; cualquier header cuyo NOMBRE termine en `-Signature`, `-Token`, `-Key` o `-Secret`, opcionalmente seguido de un segmento `-<número>` (sin importar cuál sea el nombre, p. ej. `X-Aco-Joven-Signature`, `X-Auth-Token`, `X-Hub-Signature`, o el header real de GitHub `X-Hub-Signature-256`); una contraseña en una URL (`usuario:clave@host`); o un formato conocido (`sk-…`, un token de GitHub, un JWT, un bloque de clave privada)— HPL lo reemplaza antes de que llegue al modelo por una variable, `$HPL_SECRET_<NOMBRE>`. El valor real vive sólo en memoria, en el proceso de OpenCode, mientras ese proceso siga corriendo: nunca se escribe a disco. Un comando de shell que use esa variable la recibe expandida; un agente que lancés recibe el nombre de la variable, nunca el valor. Reiniciar OpenCode olvida todo lo registrado — es la superficie de vida elegida, no un bug.
+
+Un valor que está al lado de una de esas claves sensibles se detecta desde 4 caracteres — así se cubre un `clientKey` de 7 caracteres o un `apiKey` corto. Ese piso más bajo sólo aplica al lado de una clave sensible: en cualquier otro lado, el mínimo general es 8. Para que ese umbral más chico no marque relleno sin valor real, hay una lista fija de valores que nunca se reemplazan, sea cual sea su longitud, sin importar mayúsculas/minúsculas: `null`, `none`, `nil`, `true`, `false`, `undefined`, `empty`, `xxx`/`xxxx`, una tira de `*`, `todo`, `changeme`, `placeholder`, `redacted`, y la palabra literal `secret` como valor.
+
+Lo que NO se marca nunca, aunque parezca un valor aleatorio: un hash de commit (40 caracteres hex), un checksum sha256 (64 caracteres hex), un UUID o un número — se pegan todo el tiempo y tienen que sobrevivir intactos. Un header cuyo nombre NO termina en esos cuatro sufijos, ni en uno de ellos seguido de un número, tampoco se toca — `X-Signature-Version` y `X-Api-Key-Version` terminan en `-Version`, no en `-Signature`/`-Key` ni en `-Signature`/`-Key` más dígitos. Una clave sensible sin comillas (`clave=valor`, `clave: valor`) se detecta como su propio par aunque venga inmediatamente después de otra clave no sensible en el mismo texto (`Content-Type: password=elvalorreal`, `Set-Cookie: token=elvalorreal; Path=/`): la clave irrelevante que la precede no se traga el par sensible que sigue. Ese valor sin comillas nunca cruza hacia `;`, `:`, `&` ni `?` — así, en una URL con query string (`?token=elvalorreal&page=2`), el valor detectado es sólo el de `token`, y `&page=2` sigue ahí. Tampoco se marca, a propósito, un valor sin comillas al lado de una de esas claves que no tiene ningún dígito y parece otro identificador de código (`token = accessToken`, `password: process.env.DB_PASS`, `const token = getToken()`): sin esa exclusión, pegar código real terminaba con una variable en el medio de una llamada o de una ruta. La consecuencia es que `DB_PASSWORD=secretpass` (sin comillas, sin ningún dígito) NO se detecta — `DB_PASSWORD=s3cr3tP4ss` sí, porque tiene al menos un dígito, y un valor entre comillas (`password: "plainword"`) también se detecta siempre, tenga dígitos o no. Si algo que sabés que es sensible no cae en ninguna de esas categorías, envolvelo vos mismo entre `<private>` y `</private>` — opcionalmente `<private>NOMBRE=valor</private>` para elegir el nombre de la variable — y se trata igual.
+
+La detección corre en tiempo lineal sobre el tamaño del texto, no cuadrático: pegar un texto grande y sin credenciales de verdad (un log largo, un blob base64, una línea de JS minificada) nunca debería demorar más de una fracción de segundo. Como red de contención adicional, si un mensaje o una salida de tool supera los 256&nbsp;KiB, HPL se salta directamente la detección de valores nuevos en ese texto — sólo redacta ahí los valores que ya estaban registrados de antes, algo mucho más barato — en vez de arriesgarse a que un patrón imprevisto congele la sesión.
+
+Una credencial que no se detecta (por ejemplo una contraseña corta o un número, como el `-p` de un `mysql` local) llega al modelo tal cual la escribiste, y la usa como está. El modelo no inventa una variable `$HPL_SECRET_<NOMBRE>` ni te pide que definas una: esa variable existe sólo cuando tu mensaje muestra ese nombre exacto.
+
+Lo que este mecanismo no cubre: un comando que imprime el valor mientras corre (un `curl -v`, un `echo` de la variable) lo deja en el historial de la sesión y en la TUI antes de que se pueda redactar la salida — el modelo nunca lo ve, pero vos sí, en tu propia terminal. No le pidas a un agente que imprima una credencial.
+
+El valor detrás de una `$HPL_SECRET_<NOMBRE>` vive sólo mientras corre ESE proceso de OpenCode — reiniciarlo lo olvida por completo. Si copiás un mensaje del historial de una sesión (el propio, o el de un compañero) y lo pegás en un OpenCode recién reiniciado, ese texto trae el NOMBRE de la variable, nunca el valor: un comando de shell en el proceso nuevo la expande a vacío, sin ningún aviso visible más allá de que el comando falla o la API responde "unauthorized" por una razón que no se ve en ningún lado. HPL detecta esto: si un mensaje menciona una `$HPL_SECRET_<NOMBRE>` que el proceso actual nunca registró, agrega un aviso corto nombrando esa variable, explicando que no tiene valor en esta sesión, y pidiendo pegar el valor real de nuevo. Ese aviso nunca se duplica, y si el mismo mensaje también dispara la nota de "valores reemplazados", comparten un solo bloque, no dos apéndices separados.
+
+Un cambio de plugin o de catálogo (por ejemplo, después de un `hpl update`) no se aplica a un OpenCode que ya está corriendo: hace falta reiniciarlo para que cargue la versión nueva.
+
+## Entrega en paralelo
+
+Cuando le pedís varias cosas independientes a la vez, el orquestador puede repartirlas entre varios agentes que escriben al mismo tiempo, cada uno en su propia copia de trabajo. Lo que ves:
+
+- **Dónde viven las copias.** Fuera de tu repositorio, en `${XDG_STATE_HOME:-~/.local/state}/agent-worktrees/<repo>-<hash>/<corrida>/<unidad>`. Tu `git status` no muestra nada de ellas. El orquestador las crea y, cuando termina de integrar cada unidad, las borra; una unidad que falla queda en su lugar y te da la ruta.
+- **Una línea por unidad terminada.** Si OpenCode entrega los resultados de a uno, te llega una línea corta cuando termina cada unidad, y al final el informe completo. Si llegan todos juntos, sólo el informe.
+- **El orquestador te pregunta antes de subir o publicar.** Cada unidad deja un commit local y tiene la instrucción de no hacer push, y además un `git push` de un subagente te pide confirmación (el del orquestador no cambia). Tampoco pasa por alto `FOO=1 git push`, una ruta absoluta al binario ni los `gh` que escriben hacia afuera (`pr create`, `pr merge`, `issue create`, `release create`, `repo create`). No atrapa alias, scripts propios, `sh -c`, los `gh` con banderas globales antes del subcomando (`gh -R x pr create`), `gh api -X POST` ni `gh pr comment`, y pregunta también por cualquier orden de git cuyos argumentos contengan la palabra «push» (por ejemplo `git log --grep push`); los commits no entran en eso porque cada unidad lee el mensaje de un archivo (`commit -F`). Si un subagente de profundidad dos o mayor dispara esa pregunta, queda esperando un aviso que ninguna vista muestra (defecto conocido #39112 de OpenCode); a profundidad uno el aviso aparece en la sesión raíz, cosa que se leyó del código fuente y no se midió. El orquestador integra, corre la suite completa él mismo, hace revisar el resultado y te informa; un push, una publicación o una release esperan tu respuesta. HPL pregunta antes de leer o editar `.env`, `*.pem`, `*.key` y similares; los subagentes lo tienen negado. Es un piso contra el descuido, no una frontera. Si te pide aprobar algún comando, por ejemplo uno de pruebas o `printenv`, es esperable; si un comando se deniega, el agente lo informa y nunca lo rodea.
+
+Esto es para varias unidades genuinamente independientes. Un cambio chico se hace en la misma conversación, como siempre.
+
+## Próximo paso
+
+- Para el recorrido completo de instalación: [INSTALL.md](INSTALL.md).
+- Para instalación asistida por un agente: [INSTALL_BY_AGENT.md](INSTALL_BY_AGENT.md).
+- Para la arquitectura y las decisiones de diseño: [docs/arquitectura/arquitectura.md](docs/arquitectura/arquitectura.md).

@@ -1,0 +1,229 @@
+"""Domain types: the vocabulary shared by the engine and every adapter."""
+from __future__ import annotations
+
+import dataclasses
+import unittest
+from pathlib import Path
+
+from hpl.core.types import (
+    Capability,
+    CapabilityManifest,
+    Codec,
+    ConfigKeyArtifact,
+    Detection,
+    DirectoryGrantBehavior,
+    Environment,
+    FileArtifact,
+    Layout,
+    ModelAssignment,
+    SupportTier,
+)
+
+
+class FileArtifactTest(unittest.TestCase):
+    def test_holds_opaque_bytes(self):
+        artifact = FileArtifact(id="skill:x", path=Path("/home/u/.config/x"), content=b"body", executable=False)
+        self.assertEqual(artifact.content, b"body")
+        self.assertFalse(artifact.executable)
+
+    def test_executable_has_no_default(self):
+        """Whether an artifact is a program or plain text is a fact the renderer
+        already knows; the engine must never guess one on a caller's behalf."""
+        with self.assertRaises(TypeError):
+            FileArtifact(id="a", path=Path("/tmp/a"), content=b"")
+
+    def test_is_immutable(self):
+        artifact = FileArtifact(id="a", path=Path("/tmp/a"), content=b"", executable=False)
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            artifact.content = b"other"
+
+    def test_relative_path_is_rejected(self):
+        with self.assertRaises(ValueError):
+            FileArtifact(id="a", path=Path("relative/a"), content=b"", executable=False)
+
+    def test_content_must_be_bytes(self):
+        with self.assertRaises(TypeError):
+            FileArtifact(id="a", path=Path("/tmp/a"), content="text", executable=False)
+
+    def test_executable_must_be_a_bool(self):
+        with self.assertRaises(TypeError):
+            FileArtifact(id="a", path=Path("/tmp/a"), content=b"", executable=0o755)
+
+
+class ConfigKeyArtifactTest(unittest.TestCase):
+    def test_defaults_to_json(self):
+        artifact = ConfigKeyArtifact(id="agent:x", path=Path("/tmp/c.json"), pointer="/agent/x", value={})
+        self.assertIs(artifact.codec, Codec.JSON)
+
+    def test_pointer_must_be_valid(self):
+        with self.assertRaises(ValueError):
+            ConfigKeyArtifact(id="a", path=Path("/tmp/c.json"), pointer="agent/x", value={})
+
+    def test_root_pointer_is_rejected(self):
+        with self.assertRaises(ValueError):
+            ConfigKeyArtifact(id="a", path=Path("/tmp/c.json"), pointer="", value={})
+
+    def test_addresses_a_single_field(self):
+        artifact = ConfigKeyArtifact(
+            id="model:sdd-apply", path=Path("/tmp/c.json"), pointer="/agent/sdd-apply/model", value="p/m"
+        )
+        self.assertEqual(artifact.tokens, ("agent", "sdd-apply", "model"))
+
+
+class DetectionTest(unittest.TestCase):
+    def test_present_when_only_the_binary_is_found(self):
+        self.assertTrue(Detection(installed=True, binary_path=Path("/usr/bin/x")).present)
+
+    def test_present_when_only_the_config_directory_exists(self):
+        self.assertTrue(Detection(config_dir=Path("/home/u/.config/x"), config_found=True).present)
+
+    def test_absent_when_neither_is_found(self):
+        self.assertFalse(Detection().present)
+
+
+class CapabilityManifestTest(unittest.TestCase):
+    def test_enabled_lists_only_declared_capabilities(self):
+        manifest = CapabilityManifest(cli_id="probe", skills=True, slash_commands=True)
+        self.assertEqual(manifest.enabled, frozenset({Capability.SKILLS, Capability.SLASH_COMMANDS}))
+
+    def test_defaults_to_no_capabilities(self):
+        self.assertEqual(CapabilityManifest(cli_id="probe").enabled, frozenset())
+
+    def test_carries_a_versioned_schema(self):
+        self.assertEqual(CapabilityManifest(cli_id="probe").schema, "hpl/capability-manifest/v1")
+
+    def test_empty_cli_id_is_rejected(self):
+        with self.assertRaises(ValueError):
+            CapabilityManifest(cli_id="")
+
+    def test_a_declared_reason_for_an_undeclared_capability_is_read_back(self):
+        manifest = CapabilityManifest(
+            cli_id="probe", reasons={Capability.PER_AGENT_MODEL: "no local catalog to read"}
+        )
+        self.assertEqual(manifest.reason_for(Capability.PER_AGENT_MODEL), "no local catalog to read")
+
+    def test_no_reason_declared_reads_back_as_none(self):
+        manifest = CapabilityManifest(cli_id="probe")
+        self.assertIsNone(manifest.reason_for(Capability.PER_AGENT_MODEL))
+
+    def test_a_reason_for_a_capability_actually_declared_true_is_rejected(self):
+        """A reason only ever explains an absence -- one attached to a
+        capability this same manifest declares `True` could never be shown
+        anywhere, and would silently rot the moment it drifted from the
+        truth, so it is refused at construction instead."""
+        with self.assertRaises(ValueError):
+            CapabilityManifest(
+                cli_id="probe", per_agent_model=True, reasons={Capability.PER_AGENT_MODEL: "unreachable"}
+            )
+
+    def test_a_reasons_key_that_is_not_a_capability_is_rejected_cleanly(self):
+        """`reasons` is typed `dict[Capability, str]`, but nothing before this
+        enforced it at construction: a plain string key reached `declares`,
+        which does `getattr(self, capability.value)` -- a bare string has no
+        `.value`, so the failure surfaced as an uninformative
+        `AttributeError` instead of a clear `ValueError` naming the mistake."""
+        with self.assertRaises(ValueError):
+            CapabilityManifest(cli_id="probe", reasons={"per_agent_model": "unreachable"})
+
+    def test_a_blank_reason_is_rejected(self):
+        """An empty or whitespace-only reason would show up as an empty
+        explanation everywhere `reason_for` is read back -- the TUI row, the
+        placeholder, the CLI refusal -- so it is refused at construction
+        rather than accepted and shown as nothing."""
+        with self.assertRaises(ValueError):
+            CapabilityManifest(cli_id="probe", reasons={Capability.PER_AGENT_MODEL: ""})
+
+    def test_a_whitespace_only_reason_is_rejected(self):
+        with self.assertRaises(ValueError):
+            CapabilityManifest(cli_id="probe", reasons={Capability.PER_AGENT_MODEL: "   "})
+
+
+class DirectoryGrantBehaviorTest(unittest.TestCase):
+    """The CLI-agnostic facts `hpl directory grant`'s report is built
+    from: whether this CLI already allows external directories by default
+    (so a grant changes nothing today regardless), whether granting one
+    still writes a rule of its own into the rendered configuration, and
+    whether this CLI has a deny floor at all (so `cli.py` can warn about a
+    path the floor would shadow without assuming every adapter has one).
+    `cli.py` reads all three off the adapter instead of comparing against a
+    CLI id -- see `tests/test_cli_directory_all_clis.py` for the guards
+    proving that."""
+
+    def test_holds_all_three_declared_facts(self):
+        behavior = DirectoryGrantBehavior(
+            allowed_by_default=True, writes_own_entry=False, has_deny_floor=True
+        )
+        self.assertTrue(behavior.allowed_by_default)
+        self.assertFalse(behavior.writes_own_entry)
+        self.assertTrue(behavior.has_deny_floor)
+
+    def test_is_immutable(self):
+        behavior = DirectoryGrantBehavior(
+            allowed_by_default=True, writes_own_entry=True, has_deny_floor=True
+        )
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            behavior.allowed_by_default = False
+
+
+class LayoutTest(unittest.TestCase):
+    def test_anchor_reads_a_capability_directory(self):
+        layout = Layout(config_dir=Path("/home/u/.config/x"), skills_dir=Path("/home/u/.config/x/skills"))
+        self.assertEqual(layout.anchor(Capability.SKILLS), Path("/home/u/.config/x/skills"))
+
+    def test_anchor_is_none_when_the_cli_lacks_the_concept(self):
+        self.assertIsNone(Layout(config_dir=Path("/home/u/.config/x")).anchor(Capability.SKILLS))
+
+    def test_capabilities_without_a_dedicated_anchor_report_none(self):
+        layout = Layout(config_dir=Path("/c"), settings_file=Path("/c/s.json"))
+        self.assertIsNone(layout.anchor(Capability.MCP))
+
+    def test_config_dir_must_be_absolute(self):
+        with self.assertRaises(ValueError):
+            Layout(config_dir=Path("relative"))
+
+
+class ModelAssignmentTest(unittest.TestCase):
+    def test_parses_a_provider_qualified_spec(self):
+        assignment = ModelAssignment.parse("anthropic/claude-sonnet-5")
+        self.assertEqual((assignment.provider_id, assignment.model_id), ("anthropic", "claude-sonnet-5"))
+
+    def test_keeps_slashes_that_belong_to_the_model_id(self):
+        self.assertEqual(ModelAssignment.parse("openrouter/qwen/qwen3").model_id, "qwen/qwen3")
+
+    def test_full_id_round_trips(self):
+        self.assertEqual(ModelAssignment.parse("anthropic/sonnet").full_id, "anthropic/sonnet")
+
+    def test_effort_defaults_to_the_provider_default(self):
+        self.assertIsNone(ModelAssignment.parse("anthropic/sonnet").effort)
+
+    def test_a_spec_without_a_provider_is_rejected(self):
+        for spec in ("sonnet", "/sonnet", "anthropic/", ""):
+            with self.assertRaises(ValueError, msg=spec):
+                ModelAssignment.parse(spec)
+
+
+class EnvironmentTest(unittest.TestCase):
+    def test_carries_home_and_variables(self):
+        environment = Environment(home=Path("/home/u"), variables={"ANTHROPIC_API_KEY": "x"})
+        self.assertEqual(environment.variables["ANTHROPIC_API_KEY"], "x")
+
+    def test_home_must_be_absolute(self):
+        with self.assertRaises(ValueError):
+            Environment(home=Path("u"))
+
+
+class CapabilityTest(unittest.TestCase):
+    def test_plugins_is_not_a_capability(self):
+        """Plugins have no agnostic form, so they are adapter-owned, not a capability."""
+        self.assertNotIn("plugins", {item.value for item in Capability})
+
+
+class SupportTierTest(unittest.TestCase):
+    def test_declares_the_three_levels(self):
+        self.assertEqual(
+            {tier.value for tier in SupportTier}, {"full", "partial", "experimental"}
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()

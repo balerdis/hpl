@@ -1,0 +1,16 @@
+{
+  "product_id": "hpl",
+  "display_name": "HPL",
+  "program_name": "hpl",
+  "version": "7.7.8",
+  "wordmark_words": [
+    "HPL"
+  ],
+  "release": {
+    "asset_url_template": "https://github.com/balerdis/hpl/releases/download/{tag}/{asset}",
+    "binary_asset": "hpl",
+    "latest_release_api_url": "https://api.github.com/repos/balerdis/hpl/releases/latest",
+    "release_page_url": "https://github.com/balerdis/hpl/releases",
+    "install_base_url_default": "https://github.com/balerdis/hpl/releases/latest/download"
+  }
+}

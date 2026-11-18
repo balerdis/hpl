@@ -1,0 +1,370 @@
+"""Installing and retiring an `npm`-distributed MCP server, end to end.
+
+Proving the mechanism does not depend on the network reaching npmjs.org any
+more than `test_cli_downloads.py`'s equivalent depends on a real release
+host: `FakeNpmInstaller` stands in for the real `npm ci`. The form is proven
+with a descriptor built by the test itself, patched in for `content.load()`,
+against the real POSIX filesystem and a throwaway home -- the same
+discipline `test_cli_downloads.py` already holds `download` to.
+"""
+from __future__ import annotations
+
+import io
+import json
+import stat
+import tempfile
+import unittest
+from pathlib import Path, PurePosixPath
+from unittest.mock import patch
+
+from fakes import FakeNpmInstaller
+from hpl import cli
+from hpl.adapters import available
+from hpl.core import journal as journal_module
+from hpl.core.content import Agent, AgentMode, Content, Distribution, Mcp, SESSION_STARTS_IN
+from hpl.core.types import Environment
+from real_home import RealHomeTestCase as _RealHomeTestCase
+
+AT = "2026-08-14T00:00:00+00:00"
+# Pinned to OpenCode, not "whichever adapter is registered first": this
+# suite exercises capabilities (mcp, per_agent_model, subagents declared
+# inside the settings file, ...) that only OpenCode declares today. Since
+# Claude Code registered, "available().ids()[0]" resolves alphabetically
+# to "claudecode" instead, which cannot support what this file tests.
+CLI = "opencode"
+INTEGRITY = "sha512-" + "a" * 86 + "=="
+
+#: The real lockfile this server ships beside its descriptor, read into
+#: memory by the loader in production; this test builds a `Mcp` directly, so
+#: it supplies the same bytes the loader would have read.
+PROBE_LOCKFILE = json.dumps(
+    {
+        "name": "hpl-probe",
+        "lockfileVersion": 3,
+        "requires": True,
+        "packages": {
+            "": {"name": "hpl-probe", "dependencies": {"probe-mcp": "1.2.3"}},
+            "node_modules/probe-mcp": {
+                "version": "1.2.3",
+                "resolved": "https://registry.npmjs.org/probe-mcp/-/probe-mcp-1.2.3.tgz",
+                "integrity": INTEGRITY,
+            },
+        },
+    }
+).encode("utf-8")
+
+PROBE = Mcp(
+    name="probe",
+    description="An npm-distributed probe server",
+    body="Convention body.",
+    distribution=Distribution.NPM,
+    endpoint="https://registry.npmjs.org/probe-mcp/-/probe-mcp-1.2.3.tgz",
+    source=PurePosixPath("mcp/probe.md"),
+    version="1.2.3",
+    package="probe-mcp",
+    integrity=INTEGRITY,
+    entry="cli.js",
+    npm_lockfile=PROBE_LOCKFILE,
+    npm_package_name="hpl-probe",
+)
+#: `render` derives `orchestrator_name` unconditionally now, so a `Content`
+#: used with the real adapter through `cli.install` needs a default agent too.
+_ORCHESTRATOR = Agent(
+    name=SESSION_STARTS_IN,
+    description="A probe orchestrator",
+    body="Body.\n",
+    mode=AgentMode.PRIMARY,
+    source=PurePosixPath("agents/orchestrator.md"),
+)
+PROBE_CONTENT = Content(mcp=(PROBE,), agents=(_ORCHESTRATOR,))
+
+
+class RealHomeTestCase(_RealHomeTestCase):
+    def setUp(self):
+        super().setUp()
+        # A real, executable stub `shutil.which` can find on a real PATH.
+        self.node_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.node_dir.cleanup)
+        node = Path(self.node_dir.name) / "node"
+        node.write_text("")
+        node.chmod(node.stat().st_mode | stat.S_IEXEC)
+
+    def path_with_node(self) -> str:
+        return self.node_dir.name
+
+    def runtime(self, npm_installer=None, *, node_on_path=True) -> cli.Runtime:
+        return cli.Runtime(
+            filesystem=self.filesystem,
+            home=self.home,
+            now=AT,
+            out=io.StringIO(),
+            variables={"PATH": self.path_with_node() if node_on_path else ""},
+            npm_installer=npm_installer or FakeNpmInstaller(),
+        )
+
+    def environment(self) -> Environment:
+        return Environment(home=self.home, data_dir=self.filesystem.data_dir(self.home))
+
+    def layout(self):
+        return available().get(CLI).layout(self.environment())
+
+    def present(self) -> None:
+        self.layout().config_dir.mkdir(parents=True, exist_ok=True)
+
+    def run_cli(self, *argv, npm_installer=None, node_on_path=True) -> tuple[int, dict]:
+        context = self.runtime(npm_installer, node_on_path=node_on_path)
+        code = cli.main([*argv, "--json"], runtime=context)
+        return code, json.loads(context.out.getvalue())
+
+    def installed_entries(self):
+        store = cli.journal_store(self.runtime())
+        install = journal_module.install_for(store.load(), CLI)
+        return install.entries if install is not None else ()
+
+    def target(self):
+        return self.layout().dependencies_dir / "probe" / "1.2.3"
+
+
+@patch("hpl.core.content.load", return_value=PROBE_CONTENT)
+class InstallNpmTest(RealHomeTestCase):
+    def test_naming_the_server_writes_a_lockfile_and_runs_npm_ci(self, _load):
+        self.present()
+        installer = FakeNpmInstaller()
+        code, _ = self.run_cli("install", "--cli", CLI, "--mcp", "probe", npm_installer=installer)
+        self.assertEqual(code, cli.OK)
+        self.assertEqual(installer.calls, [self.target()])
+        self.assertTrue((self.target() / "package.json").exists())
+        self.assertTrue((self.target() / "package-lock.json").exists())
+        manifest = json.loads((self.target() / "package.json").read_text())
+        self.assertEqual(manifest["name"], "hpl-probe")
+        self.assertEqual(
+            (self.target() / "package-lock.json").read_bytes(), PROBE_LOCKFILE
+        )
+
+    def test_the_journal_records_a_dependency_tree_identified_by_the_integrity(self, _load):
+        self.present()
+        self.run_cli("install", "--cli", CLI, "--mcp", "probe")
+        entry = next(e for e in self.installed_entries() if e.kind == "dependency-tree")
+        self.assertEqual(entry.id, "dependency:probe")
+        self.assertEqual(entry.after_digest, INTEGRITY)
+        self.assertEqual(entry.target, self.target())
+
+    def test_not_naming_the_server_never_installs_it(self, _load):
+        self.present()
+        installer = FakeNpmInstaller()
+        self.run_cli("install", "--cli", CLI, npm_installer=installer)
+        self.assertEqual(installer.calls, [])
+        self.assertFalse(self.target().exists())
+
+    def test_a_missing_node_fails_the_install_before_anything_is_written(self, _load):
+        self.present()
+        installer = FakeNpmInstaller()
+        code, report = self.run_cli(
+            "install", "--cli", CLI, "--mcp", "probe", npm_installer=installer, node_on_path=False
+        )
+        self.assertEqual(code, cli.FAILED)
+        self.assertIn("node", report["error"].lower())
+        self.assertEqual(installer.calls, [])
+        self.assertFalse(self.target().exists())
+        self.assertFalse(any(e.kind == "dependency-tree" for e in self.installed_entries()))
+
+    def test_a_failed_npm_ci_leaves_the_directory_as_it_found_it_and_records_nothing(self, _load):
+        self.present()
+        installer = FakeNpmInstaller(failures={self.target(): "registry unreachable"})
+        code, report = self.run_cli("install", "--cli", CLI, "--mcp", "probe", npm_installer=installer)
+        self.assertEqual(code, cli.FAILED)
+        self.assertIn("registry unreachable", report["error"])
+        self.assertFalse(self.target().exists())
+        self.assertFalse(self.target().parent.exists())
+        self.assertFalse(any(e.kind == "dependency-tree" for e in self.installed_entries()))
+
+    def test_reinstalling_the_same_version_does_not_reinvoke_npm(self, _load):
+        self.present()
+        installer = FakeNpmInstaller()
+        self.run_cli("install", "--cli", CLI, "--mcp", "probe", npm_installer=installer)
+        self.run_cli("install", "--cli", CLI, "--mcp", "probe", npm_installer=installer)
+        self.assertEqual(installer.calls, [self.target()])
+
+    def test_reinstalling_the_same_version_needs_no_node_on_path(self, _load):
+        """A reinstall that keeps exactly the version already on disk fetches
+        nothing, so it needs no Node at all -- but the preflight guard used to
+        fire on `distribution is NPM` alone, before the journal was even read,
+        with no way to tell "would keep it" apart from "would fetch it". Node
+        installed through `nvm` is routinely absent from a non-interactive
+        `PATH` (scripts, cron, CI), which made this a real regression, not a
+        corner case.
+        """
+        self.present()
+        self.run_cli("install", "--cli", CLI, "--mcp", "probe")
+        code, report = self.run_cli(
+            "install", "--cli", CLI, "--mcp", "probe", node_on_path=False
+        )
+        self.assertEqual(code, cli.OK)
+        self.assertEqual(report["status"], "installed")
+        self.assertIn("dependency:probe", [item["id"] for item in report["unchanged"]])
+
+    def test_reinstalling_the_same_version_needs_no_node_on_a_dry_run_either(self, _load):
+        """The `--dry-run` twin of the reinstall case above: the TUI's plan
+        preview always runs with `dry_run=True`, so this is what keeps a
+        reinstall preview from being refused for a runtime the reinstall would
+        never actually need.
+        """
+        self.present()
+        self.run_cli("install", "--cli", CLI, "--mcp", "probe")
+        code, report = self.run_cli(
+            "install", "--cli", CLI, "--mcp", "probe", "--dry-run", node_on_path=False
+        )
+        self.assertEqual(code, cli.OK)
+        self.assertEqual(report["status"], "planned")
+
+
+@patch("hpl.core.content.load", return_value=PROBE_CONTENT)
+class UninstallNpmTest(RealHomeTestCase):
+    def test_uninstalling_removes_the_whole_materialized_tree(self, _load):
+        self.present()
+        self.run_cli("install", "--cli", CLI, "--mcp", "probe")
+        self.assertTrue((self.target() / "package.json").exists())
+        code, report = self.run_cli("uninstall", "--cli", CLI)
+        self.assertEqual(code, cli.OK)
+        self.assertFalse(self.target().exists())
+        self.assertIn("dependency:probe", report["removed"])
+
+    def test_uninstalling_leaves_no_journal_entry_behind(self, _load):
+        self.present()
+        self.run_cli("install", "--cli", CLI, "--mcp", "probe")
+        self.run_cli("uninstall", "--cli", CLI)
+        journal = cli.journal_store(self.runtime()).load()
+        self.assertIsNone(journal_module.install_for(journal, CLI))
+
+    def test_reinstalling_with_mcp_none_retires_it_without_uninstalling(self, _load):
+        # `--mcp` still decides what installs: an explicit empty selection
+        # (`--mcp none`) on a later run retires just this server, and the
+        # rest of the installation stays. Dropping `--mcp` altogether no
+        # longer reaches this path -- a bare reinstall over a recorded
+        # selection now refuses instead of silently retiring it, so the
+        # retirement has to be asked for explicitly with `--mcp none`.
+        self.present()
+        self.run_cli("install", "--cli", CLI, "--mcp", "probe")
+        code, report = self.run_cli("install", "--cli", CLI, "--mcp", "none")
+        self.assertEqual(code, cli.OK)
+        self.assertFalse(self.target().exists())
+        self.assertIn("dependency:probe", [item["id"] for item in report["retired"]])
+        self.assertNotIn("dependency:probe", [e.id for e in self.installed_entries()])
+        self.assertTrue(self.layout().config_dir.is_dir())
+
+
+@patch("hpl.core.content.load", return_value=PROBE_CONTENT)
+class RestoreDependencyTreeTest(RealHomeTestCase):
+    """`restore` putting back a dependency tree an install left behind.
+
+    `apply` writes the server's configuration key only after
+    `_materialize_dependencies` has already placed the tree on disk. Locking
+    `config_dir` down to read-and-traverse-only, right after `present()`
+    creates it, makes the config write the one that fails: the tree is
+    already there, complete, by the time it does. Nothing in `_install`
+    catches that failure and takes the tree back out -- this is exactly the
+    hole the debt names, reproduced on real disk rather than asserted from
+    reading the code.
+    """
+
+    def lock_config_dir(self) -> None:
+        config_dir = self.layout().config_dir
+        config_dir.chmod(0o500)
+        self.addCleanup(config_dir.chmod, 0o755)
+
+    def test_restore_removes_a_tree_a_failed_install_left_behind(self, _load):
+        self.present()
+        self.lock_config_dir()
+
+        code, report = self.run_cli("install", "--cli", CLI, "--mcp", "probe")
+
+        # The precondition this test exists to prove: the failure is real,
+        # and the tree it should have taken back out is still on disk.
+        self.assertEqual(code, cli.FAILED)
+        self.assertEqual(report["status"], "failed")
+        self.assertTrue((self.target() / "package.json").exists())
+        self.assertEqual(self.installed_entries(), ())
+
+        self.layout().config_dir.chmod(0o755)
+        code, report = self.run_cli("restore")
+
+        self.assertEqual(code, cli.OK)
+        self.assertFalse(self.target().exists(), "the leftover tree must be gone after restore")
+
+    def test_the_tree_did_not_exist_before_and_restore_removes_it(self, _load):
+        self.present()
+        self.lock_config_dir()
+        self.run_cli("install", "--cli", CLI, "--mcp", "probe")
+        self.assertTrue(self.target().exists())
+
+        self.layout().config_dir.chmod(0o755)
+        self.run_cli("restore")
+
+        self.assertFalse(self.target().exists())
+
+    def test_a_partially_materialized_tree_is_fully_removed(self, _load):
+        self.present()
+        self.lock_config_dir()
+
+        class LeavesExtraFilesBehind(FakeNpmInstaller):
+            """Stands in for an `npm ci` that unpacked more than one file
+            before this run went on to fail elsewhere -- `materialize_npm`
+            only ever writes the lockfile itself, so this is what makes a
+            "partial tree" mean more than the two files every install
+            already leaves."""
+
+            def install(self, directory: Path) -> None:
+                super().install(directory)
+                (directory / "node_modules_stub").write_text("partial")
+
+        self.run_cli("install", "--cli", CLI, "--mcp", "probe", npm_installer=LeavesExtraFilesBehind())
+        self.assertTrue((self.target() / "node_modules_stub").exists())
+
+        self.layout().config_dir.chmod(0o755)
+        self.run_cli("restore")
+
+        self.assertFalse(self.target().exists())
+
+    def test_restore_is_idempotent(self, _load):
+        # Same generation both times, on purpose: asking for "the most
+        # recent" a second time would resolve to the protective snapshot the
+        # first `restore` itself just took, which is a different question
+        # (and a real one -- `RetentionTest` already owns it) from whether
+        # replaying one generation twice is safe.
+        self.present()
+        self.lock_config_dir()
+        self.run_cli("install", "--cli", CLI, "--mcp", "probe")
+
+        self.layout().config_dir.chmod(0o755)
+        first_code, _ = self.run_cli("restore", "1")
+        self.assertEqual(first_code, cli.OK)
+        self.assertFalse(self.target().exists())
+
+        second_code, second_report = self.run_cli("restore", "1")
+        self.assertEqual(second_code, cli.OK)
+        self.assertFalse(self.target().exists())
+        self.assertEqual(second_report["status"], "restored")
+
+    def test_a_directory_that_cannot_be_removed_raises_instead_of_succeeding(self, _load):
+        self.present()
+        self.lock_config_dir()
+        self.run_cli("install", "--cli", CLI, "--mcp", "probe")
+        self.assertTrue(self.target().exists())
+
+        self.layout().config_dir.chmod(0o755)
+        # Blocking the parent, not the target itself: removing a directory is
+        # a write to what contains it, the same rule that already governs
+        # `remove` on a single file.
+        self.target().parent.chmod(0o500)
+        self.addCleanup(self.target().parent.chmod, 0o755)
+
+        code, report = self.run_cli("restore")
+
+        self.assertEqual(code, cli.FAILED)
+        self.assertEqual(report["status"], "failed")
+        self.target().parent.chmod(0o755)
+        self.assertTrue(self.target().exists(), "a raised failure must not be reported as a removal")
+
+
+if __name__ == "__main__":
+    unittest.main()

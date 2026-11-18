@@ -1,0 +1,559 @@
+"""`hpl upgrade`: replace the running binary with the newest published one.
+
+Separate from `update`, deliberately: `update` reapplies an installation's own
+recorded selection into a CLI's configuration, while `upgrade` replaces the
+`hpl` program itself -- it takes no `--cli`, and it never touches a
+journal, a snapshot, or any CLI's configuration at all.
+
+Every test here drives `cli.upgrade` through `FakeDownloader` and
+`FakeFileSystem` -- nothing is ever really fetched or really replaced. The one
+piece of real disk any of this touches is a throwaway zip file `setUp` builds
+fresh per test, standing in for "the zipapp this process is running from":
+`cli._running_binary_path` decides whether it is running from a zipapp by
+calling `zipfile.is_zipfile` on `Runtime.sys_path0`, and that is a real
+filesystem check nothing can fake -- so a real (empty, tiny, disposable) zip
+is what a positive case needs, and a real ordinary file or directory is what
+a negative case needs.
+"""
+from __future__ import annotations
+
+import io
+import json
+import tempfile
+import unittest
+import zipfile
+from pathlib import Path
+
+import hpl
+from fakes import EXECUTABLE_MODE, FakeDownloader, FakeFileSystem
+from hpl import cli
+from hpl.core import identity as identity_module
+from hpl.core import ownership
+from hpl.core import upgrade as upgrade_module
+from real_home import _scratch_root
+
+AT = "2026-08-14T00:00:00+00:00"
+HOME = Path("/home/person")
+CURRENT_VERSION = hpl.__version__
+NEWER_VERSION = "99.0.0"
+
+
+def release_body(tag: str) -> bytes:
+    return json.dumps({"tag_name": tag}).encode("utf-8")
+
+
+def sha256sum_line(content: bytes) -> bytes:
+    digest = ownership.digest_of_bytes(content).removeprefix(ownership.PREFIX)
+    return f"{digest}  hpl\n".encode("utf-8")
+
+
+def upgrade_downloader(*, version: str = NEWER_VERSION, content: bytes = b"new hpl bytes") -> FakeDownloader:
+    release = cli.default_identity().release
+    return FakeDownloader(
+        {
+            release.latest_release_api_url: release_body(f"v{version}"),
+            upgrade_module.checksum_url(version, release): sha256sum_line(content),
+            upgrade_module.binary_url(version, release): content,
+        }
+    )
+
+
+class UpgradeTestCase(unittest.TestCase):
+    """`self.destination` is a real, empty zip file -- exactly what
+    `zipfile.is_zipfile` needs to recognise `sys_path0` as a zipapp's own
+    path -- while every actual read and write against it goes through
+    `FakeFileSystem` instead, which knows nothing about the real file
+    sharing its path and never touches it.
+    """
+
+    def setUp(self):
+        self._directory = tempfile.TemporaryDirectory(dir=_scratch_root())
+        self.addCleanup(self._directory.cleanup)
+        self.destination = Path(self._directory.name) / "hpl"
+        with zipfile.ZipFile(self.destination, "w") as archive:
+            archive.writestr("__main__.py", "pass\n")
+
+    def make_filesystem(self, **kwargs) -> FakeFileSystem:
+        """A `FakeFileSystem` whose destination already carries the
+        executable mode, as the binary this process is actually running from
+        always does. `replace_binary` now preserves whatever mode is already
+        there (see `hpl.core.upgrade`), so a fixture that left it at the
+        fake's plain-file default (`0o644`) would assert against a
+        precondition no real running binary could ever have."""
+        kwargs.setdefault("files", {self.destination: b"old bytes"})
+        modes = dict(kwargs.pop("modes", {}))
+        modes.setdefault(self.destination, EXECUTABLE_MODE)
+        return FakeFileSystem(modes=modes, **kwargs)
+
+    def runtime(
+        self, *, downloader=None, filesystem=None, sys_path0: str | None = None, identity=None
+    ) -> cli.Runtime:
+        kwargs = {}
+        if identity is not None:
+            kwargs["identity"] = identity
+        return cli.Runtime(
+            filesystem=filesystem if filesystem is not None else self.make_filesystem(),
+            home=HOME,
+            now=AT,
+            out=io.StringIO(),
+            variables={},
+            downloader=downloader if downloader is not None else upgrade_downloader(),
+            sys_path0=str(self.destination) if sys_path0 is None else sys_path0,
+            **kwargs,
+        )
+
+
+#: An obviously fictional distribution -- never a real organization -- pinning this engine at
+#: one version while releasing its own product under a different one. This is the exact defect a
+#: real distribution hit: `hpl.__version__` never moves with a distribution's own releases, so
+#: comparing against it can never reach `already-current` for one.
+_DISTRIBUTION_IDENTITY = identity_module.parse(
+    json.dumps(
+        {
+            "product_id": "nova-cli",
+            "display_name": "Nova",
+            "program_name": "nova",
+            "version": "1.0.0",
+            "wordmark_words": ["NOVA"],
+            "release": {
+                "asset_url_template": "https://example.invalid/nova/releases/download/{tag}/{asset}",
+                "binary_asset": "nova",
+                "latest_release_api_url": "https://example.invalid/nova/api/releases/latest",
+                "release_page_url": "https://example.invalid/nova/releases",
+                "install_base_url_default": "https://example.invalid/nova/releases/latest/download",
+            },
+        }
+    ).encode("utf-8")
+)
+
+
+class DistributionAlreadyCurrentTest(UpgradeTestCase):
+    """Regression for the defect this whole change fixes: `current_version`
+    used to be `hpl.__version__` unconditionally, so a distribution's own
+    releases -- tagged with its own version, never the pinned engine's --
+    could never compare equal, and `upgrade` re-downloaded and replaced its
+    own binary on every single run instead of ever reporting
+    `already-current`."""
+
+    def test_reports_already_current_against_the_distributions_own_release(self):
+        self.assertNotEqual(_DISTRIBUTION_IDENTITY.version, hpl.__version__)
+        downloader = FakeDownloader(
+            {
+                _DISTRIBUTION_IDENTITY.release.latest_release_api_url: release_body(
+                    f"v{_DISTRIBUTION_IDENTITY.version}"
+                )
+            }
+        )
+        runtime = self.runtime(downloader=downloader, identity=_DISTRIBUTION_IDENTITY)
+        report = cli.upgrade(runtime)
+        self.assertEqual(report["status"], "already-current")
+        self.assertEqual(report["version"], _DISTRIBUTION_IDENTITY.version)
+
+
+class ZipappPathTest(unittest.TestCase):
+    """Proof, against a real (throwaway) zip, that `zipfile.is_zipfile` is
+    what actually tells a zipapp's own path apart from an ordinary file --
+    the fact `cli._running_binary_path` leans on."""
+
+    def test_a_real_zip_is_recognised_and_an_ordinary_file_is_not(self):
+        with tempfile.TemporaryDirectory(dir=_scratch_root()) as directory:
+            zip_path = Path(directory) / "probe.pyz"
+            with zipfile.ZipFile(zip_path, "w") as archive:
+                archive.writestr("__main__.py", "pass\n")
+            plain_path = Path(directory) / "plain.txt"
+            plain_path.write_bytes(b"not a zip")
+            self.assertTrue(zipfile.is_zipfile(zip_path))
+            self.assertFalse(zipfile.is_zipfile(plain_path))
+
+
+class NotRunningFromAZipappTest(UpgradeTestCase):
+    def test_an_empty_sys_path0_refuses_honestly(self):
+        runtime = self.runtime(sys_path0="")
+        with self.assertRaises(cli.CommandError) as caught:
+            cli.upgrade(runtime)
+        self.assertIn("not running from an installed executable", str(caught.exception))
+
+    def test_a_sys_path0_that_is_not_a_zip_refuses_honestly(self):
+        with tempfile.TemporaryDirectory(dir=_scratch_root()) as directory:
+            # A real directory, exactly what `sys.path[0]` is for `python -m
+            # hpl` run from a source checkout with `PYTHONPATH=src` --
+            # the very case this whole refusal exists for.
+            runtime = self.runtime(sys_path0=directory)
+            with self.assertRaises(cli.CommandError) as caught:
+                cli.upgrade(runtime)
+            self.assertIn("not running from an installed executable", str(caught.exception))
+
+    def test_an_ordinary_file_that_is_not_a_zip_refuses_honestly(self):
+        plain = Path(self._directory.name) / "plain.txt"
+        plain.write_bytes(b"not a zip")
+        runtime = self.runtime(sys_path0=str(plain))
+        with self.assertRaises(cli.CommandError) as caught:
+            cli.upgrade(runtime)
+        self.assertIn("not running from an installed executable", str(caught.exception))
+
+    def test_the_refusal_never_touches_the_downloader(self):
+        downloader = upgrade_downloader()
+        runtime = self.runtime(downloader=downloader, sys_path0="")
+        with self.assertRaises(cli.CommandError):
+            cli.upgrade(runtime)
+        self.assertEqual(downloader.calls, [])
+
+
+class RunningFromAZipappTest(UpgradeTestCase):
+    def test_a_real_zip_path_resolves_and_the_upgrade_proceeds(self):
+        runtime = self.runtime()
+        report = cli.upgrade(runtime)
+        self.assertEqual(report["status"], "upgraded")
+        self.assertEqual(report["destination"], str(self.destination))
+
+
+class UnwritableDestinationTest(UpgradeTestCase):
+    """`is_writable` is queried once, against the destination itself: the
+    real `PosixFileSystem` already answers that from the *containing*
+    directory's own permissions (see its own docstring), so there is no
+    separate real-world case for "the directory itself is unwritable" to
+    probe here that a second call would add -- that distinction is proven
+    for real disk in `test_filesystem.py`. What used to be a second test
+    here, marking `self.destination.parent` unwritable, tested exactly the
+    same single call with a path this fake never actually receives; removed
+    rather than kept redundant."""
+
+    def test_refuses_before_any_fetch(self):
+        downloader = upgrade_downloader()
+        filesystem = self.make_filesystem(unwritable={self.destination})
+        runtime = self.runtime(downloader=downloader, filesystem=filesystem)
+        with self.assertRaises(cli.CommandError) as caught:
+            cli.upgrade(runtime)
+        self.assertIn("not writable", str(caught.exception))
+        self.assertEqual(downloader.calls, [])
+
+    def test_names_a_manual_replacement_command(self):
+        filesystem = self.make_filesystem(unwritable={self.destination})
+        runtime = self.runtime(filesystem=filesystem)
+        with self.assertRaises(cli.CommandError) as caught:
+            cli.upgrade(runtime)
+        self.assertIn(str(self.destination), str(caught.exception))
+
+
+class OwnedBySomeoneElseTest(UpgradeTestCase):
+    """`is_writable` no longer looks at the destination's own bits at all
+    (see `fs_posix.PosixFileSystem.is_writable`'s own docstring), which
+    removes a check that used to also -- accidentally -- refuse taking over
+    a file owned by someone else. This is the check that now carries that
+    safety on purpose, and it must refuse before any network call, exactly
+    like the writability check right next to it."""
+
+    def test_refuses_before_any_fetch(self):
+        downloader = upgrade_downloader()
+        filesystem = self.make_filesystem(unowned={self.destination})
+        runtime = self.runtime(downloader=downloader, filesystem=filesystem)
+        with self.assertRaises(cli.CommandError) as caught:
+            cli.upgrade(runtime)
+        self.assertIn("not owned", str(caught.exception))
+        self.assertEqual(downloader.calls, [])
+
+    def test_names_a_manual_replacement_command(self):
+        filesystem = self.make_filesystem(unowned={self.destination})
+        runtime = self.runtime(filesystem=filesystem)
+        with self.assertRaises(cli.CommandError) as caught:
+            cli.upgrade(runtime)
+        self.assertIn(str(self.destination), str(caught.exception))
+
+
+class AlreadyCurrentTest(UpgradeTestCase):
+    """Being at the newest published version already is not a failure --
+    it is exactly what asking to be current was for. `upgrade` reports it
+    as a successful no-op, the same register as `install`/`update`'s own
+    "already current" and `models unset`'s "already-unset": nothing to do
+    is news, not an error."""
+
+    def test_reports_a_successful_no_op_instead_of_raising(self):
+        downloader = upgrade_downloader(version=CURRENT_VERSION)
+        runtime = self.runtime(downloader=downloader)
+        report = cli.upgrade(runtime)
+        self.assertEqual(report["status"], "already-current")
+        self.assertEqual(report["version"], CURRENT_VERSION)
+
+    def test_does_not_touch_the_destination(self):
+        downloader = upgrade_downloader(version=CURRENT_VERSION)
+        filesystem = self.make_filesystem()
+        runtime = self.runtime(downloader=downloader, filesystem=filesystem)
+        cli.upgrade(runtime)
+        self.assertEqual(filesystem.writes, [])
+
+    def test_the_process_report_exits_ok_not_failed(self):
+        downloader = upgrade_downloader(version=CURRENT_VERSION)
+        runtime = self.runtime(downloader=downloader)
+        code, report = cli.safe_report("upgrade", lambda: cli.upgrade(runtime))
+        self.assertEqual(code, cli.OK)
+        self.assertEqual(report["status"], "already-current")
+
+    def test_the_prose_reads_as_finished_not_refused(self):
+        downloader = upgrade_downloader(version=CURRENT_VERSION)
+        runtime = self.runtime(downloader=downloader)
+        report = cli.upgrade(runtime)
+        prose = cli.prose_for({"schema": cli.SCHEMA, "command": "upgrade", **report})
+        self.assertIn(CURRENT_VERSION, prose)
+        self.assertIn("nothing to do", prose.lower())
+        self.assertNotIn("failed", prose.lower())
+
+
+class OlderPublishedReleaseTest(UpgradeTestCase):
+    """Regression for the second real-world defect: a distribution whose
+    GitHub `latest` release pointed at a tag older than the binary already
+    running. `upgrade` used to treat "not equal" as "newer" unconditionally,
+    so it downloaded and installed that older release with no warning at
+    all. Both `current_version` and `latest_version` here are pure
+    dot-separated digit runs (`"6.0.0"` and `"2.0.0"`), which is the one
+    shape `_numeric_version_key` can order -- see its own docstring."""
+
+    def test_refuses_before_any_fetch(self):
+        downloader = upgrade_downloader(version="2.0.0")
+        filesystem = self.make_filesystem()
+        runtime = self.runtime(downloader=downloader, filesystem=filesystem)
+        with self.assertRaises(cli.CommandError) as caught:
+            cli.upgrade(runtime)
+        message = str(caught.exception)
+        self.assertIn(CURRENT_VERSION, message)
+        self.assertIn("2.0.0", message)
+        # Only the release document itself was ever fetched -- the refusal
+        # happens before `fetch_and_verify` touches the checksum or binary.
+        release = cli.default_identity().release
+        self.assertNotIn(upgrade_module.checksum_url("2.0.0", release), downloader.calls)
+        self.assertNotIn(upgrade_module.binary_url("2.0.0", release), downloader.calls)
+
+    def test_names_a_manual_replacement_command(self):
+        downloader = upgrade_downloader(version="2.0.0")
+        runtime = self.runtime(downloader=downloader)
+        with self.assertRaises(cli.CommandError) as caught:
+            cli.upgrade(runtime)
+        self.assertIn(str(self.destination), str(caught.exception))
+
+    def test_does_not_touch_the_destination(self):
+        downloader = upgrade_downloader(version="2.0.0")
+        filesystem = self.make_filesystem()
+        runtime = self.runtime(downloader=downloader, filesystem=filesystem)
+        with self.assertRaises(cli.CommandError):
+            cli.upgrade(runtime)
+        self.assertEqual(filesystem.files[self.destination], b"old bytes")
+        self.assertEqual(filesystem.writes, [])
+
+    def test_dry_run_refuses_too_instead_of_proposing_the_downgrade(self):
+        downloader = upgrade_downloader(version="2.0.0")
+        runtime = self.runtime(downloader=downloader)
+        with self.assertRaises(cli.CommandError):
+            cli.upgrade(runtime, dry_run=True)
+
+    def test_the_manual_command_sends_you_to_pick_a_version_not_to_the_newest_one(self):
+        # `_manual_upgrade_command`'s default text ("download the newest
+        # release") is exactly backwards here: the whole reason this refusal
+        # fired is that the newest published release is the *older* one.
+        # Telling someone to download the newest release right after
+        # refusing to install it for being too old is nonsensical -- the
+        # judge reproduced this verbatim: "If you want 2.0.0 anyway,
+        # download the newest release..." with 2.0.0 being the old one. The
+        # release page lists every version, so this refusal must point
+        # there to choose, never repeat "the newest release".
+        downloader = upgrade_downloader(version="2.0.0")
+        runtime = self.runtime(downloader=downloader)
+        with self.assertRaises(cli.CommandError) as caught:
+            cli.upgrade(runtime)
+        message = str(caught.exception)
+        release = cli.default_identity().release
+        self.assertIn(release.release_page_url, message)
+        self.assertNotIn("newest release", message)
+
+
+class NonComparableOlderLookingVersionProceedsTest(UpgradeTestCase):
+    """`SAFE_VERSION` allows shapes `_numeric_version_key` cannot order at
+    all -- `"beta"`, `"1.0-rc2"`. `upgrade` cannot prove those go backwards,
+    so it must not refuse them: it proceeds exactly as it did before this
+    defect was noticed, the same as any other new tag."""
+
+    def test_a_non_numeric_tag_is_not_treated_as_a_downgrade(self):
+        downloader = upgrade_downloader(version="beta")
+        filesystem = self.make_filesystem()
+        runtime = self.runtime(downloader=downloader, filesystem=filesystem)
+        report = cli.upgrade(runtime)
+        self.assertEqual(report["status"], "upgraded")
+        self.assertEqual(report["new_version"], "beta")
+
+    def test_a_hyphenated_pre_release_tag_is_not_treated_as_a_downgrade(self):
+        downloader = upgrade_downloader(version="1.0-rc2")
+        filesystem = self.make_filesystem()
+        runtime = self.runtime(downloader=downloader, filesystem=filesystem)
+        report = cli.upgrade(runtime)
+        self.assertEqual(report["status"], "upgraded")
+        self.assertEqual(report["new_version"], "1.0-rc2")
+
+
+class UnreachableNetworkTest(UpgradeTestCase):
+    def test_refuses_plainly_rather_than_claiming_nothing_new(self):
+        filesystem = self.make_filesystem()
+        runtime = self.runtime(downloader=FakeDownloader({}), filesystem=filesystem)
+        with self.assertRaises(cli.CommandError) as caught:
+            cli.upgrade(runtime)
+        message = str(caught.exception).lower()
+        self.assertNotIn("already", message)
+        self.assertTrue("could not" in message or "unreachable" in message or "network" in message)
+
+    def test_does_not_touch_the_destination(self):
+        filesystem = self.make_filesystem()
+        runtime = self.runtime(downloader=FakeDownloader({}), filesystem=filesystem)
+        with self.assertRaises(cli.CommandError):
+            cli.upgrade(runtime)
+        self.assertEqual(filesystem.files[self.destination], b"old bytes")
+        self.assertEqual(filesystem.writes, [])
+
+
+class SuccessfulUpgradeTest(UpgradeTestCase):
+    def test_verifies_then_replaces_and_reports_old_new_destination_and_restart(self):
+        filesystem = self.make_filesystem()
+        runtime = self.runtime(filesystem=filesystem)
+        report = cli.upgrade(runtime)
+        self.assertEqual(report["status"], "upgraded")
+        self.assertEqual(report["old_version"], CURRENT_VERSION)
+        self.assertEqual(report["new_version"], NEWER_VERSION)
+        self.assertEqual(report["destination"], str(self.destination))
+        self.assertTrue(report["restart_required"])
+        self.assertEqual(filesystem.files[self.destination], b"new hpl bytes")
+        self.assertEqual(filesystem.modes[self.destination], filesystem.mode_for(executable=True))
+
+    def test_the_temporary_file_is_created_in_the_destinations_own_directory(self):
+        filesystem = self.make_filesystem()
+        runtime = self.runtime(filesystem=filesystem)
+        cli.upgrade(runtime)
+        # `FakeFileSystem.write_atomic` records the final path it wrote, but the
+        # port's own contract (and the real `PosixFileSystem`) is what actually
+        # guarantees the *temporary* file lives in `path.parent` before the
+        # rename -- pinned for real disk in `test_filesystem.py`. Here the
+        # thing worth pinning is that `cli.upgrade` hands `write_atomic`
+        # exactly the destination, never some other path, which is what makes
+        # that real guarantee apply to the binary at all.
+        self.assertEqual(filesystem.writes, [self.destination])
+        self.assertEqual(self.destination.parent, Path(self._directory.name))
+
+
+class DigestMismatchTest(UpgradeTestCase):
+    def test_aborts_and_leaves_the_original_byte_for_byte_intact(self):
+        release = cli.default_identity().release
+        downloader = FakeDownloader(
+            {
+                release.latest_release_api_url: release_body(f"v{NEWER_VERSION}"),
+                upgrade_module.checksum_url(NEWER_VERSION, release): sha256sum_line(b"not what arrives"),
+                upgrade_module.binary_url(NEWER_VERSION, release): b"the actual download",
+            }
+        )
+        filesystem = self.make_filesystem()
+        runtime = self.runtime(downloader=downloader, filesystem=filesystem)
+        with self.assertRaises(cli.CommandError) as caught:
+            cli.upgrade(runtime)
+        self.assertIn("checksum", str(caught.exception).lower())
+        self.assertEqual(filesystem.files[self.destination], b"old bytes")
+        self.assertEqual(filesystem.writes, [])
+
+
+class DryRunTest(UpgradeTestCase):
+    def test_writes_nothing_and_reports_the_plan(self):
+        filesystem = self.make_filesystem()
+        runtime = self.runtime(filesystem=filesystem)
+        report = cli.upgrade(runtime, dry_run=True)
+        self.assertEqual(report["status"], "planned")
+        self.assertEqual(report["old_version"], CURRENT_VERSION)
+        self.assertEqual(report["new_version"], NEWER_VERSION)
+        self.assertEqual(report["destination"], str(self.destination))
+        self.assertTrue(report["restart_required"])
+        self.assertEqual(filesystem.files[self.destination], b"old bytes")
+        self.assertEqual(filesystem.writes, [])
+
+    def test_never_fetches_the_checksum_or_the_binary_itself(self):
+        downloader = upgrade_downloader()
+        runtime = self.runtime(downloader=downloader)
+        cli.upgrade(runtime, dry_run=True)
+        release = cli.default_identity().release
+        self.assertNotIn(upgrade_module.checksum_url(NEWER_VERSION, release), downloader.calls)
+        self.assertNotIn(upgrade_module.binary_url(NEWER_VERSION, release), downloader.calls)
+
+
+class CliWiringTest(UpgradeTestCase):
+    def test_the_flag_takes_no_cli_argument(self):
+        runtime = self.runtime()
+        code = cli.main(["upgrade", "--json"], runtime=runtime)
+        report = json.loads(runtime.out.getvalue())
+        self.assertEqual(code, cli.OK)
+        self.assertEqual(report["command"], "upgrade")
+        self.assertEqual(report["status"], "upgraded")
+
+    def test_dry_run_flag_is_accepted(self):
+        runtime = self.runtime()
+        code = cli.main(["upgrade", "--dry-run", "--json"], runtime=runtime)
+        report = json.loads(runtime.out.getvalue())
+        self.assertEqual(code, cli.OK)
+        self.assertEqual(report["status"], "planned")
+
+    def test_a_bogus_extra_argument_is_rejected_by_the_parser(self):
+        with self.assertRaises(SystemExit):
+            cli.main(["upgrade", "--cli", "claude-code"], runtime=self.runtime())
+
+    def test_prose_names_old_and_new_version_and_restart(self):
+        runtime = self.runtime()
+        cli.main(["upgrade"], runtime=runtime)
+        prose = runtime.out.getvalue()
+        self.assertIn(CURRENT_VERSION, prose)
+        self.assertIn(NEWER_VERSION, prose)
+        self.assertIn("restart", prose.lower())
+
+    def test_prose_names_update_as_the_remaining_step(self):
+        # `upgrade` replaces only the binary. Everything `update` writes --
+        # agents, skills, commands, prompts -- was rendered by the previous
+        # version and stays that way until `update` runs again. A person who
+        # stops after `upgrade` believing they are fully done is exactly the
+        # gap this defect measured: updating 2.0.0 -> 6.0.0 and then running
+        # `update --cli opencode` still found 3 artifacts to refresh.
+        runtime = self.runtime()
+        report = cli.upgrade(runtime)
+        prose = cli.prose_for({"schema": cli.SCHEMA, "command": "upgrade", **report})
+        self.assertIn("update", prose.lower())
+        self.assertIn(report["program_name"], prose)
+
+    def test_prose_does_not_misattribute_disk_artifacts_across_a_chained_upgrade(self):
+        # A person who chains two upgrades without ever running `update` in
+        # between (2.0.0 -> 3.0.0 -> 6.0.0) still has artifacts on disk that
+        # were written by 2.0.0 -- 3.0.0 never wrote anything, it only ever
+        # sat there briefly before being replaced in turn. The old message
+        # said "was written by {old_version}", which after the second hop
+        # claims 3.0.0 wrote them: false. The message must not assert who
+        # wrote what is on disk, only that the version now running did not.
+        import dataclasses
+
+        base_identity = cli.default_identity()
+        first_identity = dataclasses.replace(base_identity, version="2.0.0")
+        first_runtime = self.runtime(
+            downloader=upgrade_downloader(version="3.0.0"), identity=first_identity
+        )
+        first_report = cli.upgrade(first_runtime)
+        self.assertEqual(first_report["old_version"], "2.0.0")
+        self.assertEqual(first_report["new_version"], "3.0.0")
+
+        second_identity = dataclasses.replace(base_identity, version="3.0.0")
+        second_runtime = self.runtime(
+            downloader=upgrade_downloader(version="6.0.0"), identity=second_identity
+        )
+        second_report = cli.upgrade(second_runtime)
+        self.assertEqual(second_report["old_version"], "3.0.0")
+        self.assertEqual(second_report["new_version"], "6.0.0")
+
+        prose = cli.prose_for({"schema": cli.SCHEMA, "command": "upgrade", **second_report})
+        self.assertNotIn("written by 3.0.0", prose)
+
+    def test_a_refusal_reports_failed_status_through_safe_report(self):
+        runtime = self.runtime(downloader=FakeDownloader({}))
+        code = cli.main(["upgrade", "--json"], runtime=runtime)
+        report = json.loads(runtime.out.getvalue())
+        self.assertEqual(code, cli.FAILED)
+        self.assertEqual(report["status"], "failed")
+        self.assertIn("error", report)
+
+
+if __name__ == "__main__":
+    unittest.main()

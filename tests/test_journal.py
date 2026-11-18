@@ -1,0 +1,614 @@
+"""The ownership journal: what HPL may take back, and what it must leave alone."""
+from __future__ import annotations
+
+import unittest
+from pathlib import Path, PurePosixPath
+
+from hpl.core import journal as journal_module
+from hpl.core.journal import Install, Journal, JournalError, Link, Record
+
+HOME = Path("/home/probe")
+CONFIG = HOME / ".config" / "opencode"
+DATA_DIR = HOME / ".local" / "share" / "hpl"
+AT = "2026-08-14T00:00:00+00:00"
+
+
+def record(**overrides) -> Record:
+    fields = dict(
+        id="skill:alpha",
+        kind="file",
+        target=CONFIG / "skills/alpha/SKILL.md",
+        after_digest="sha256:" + "a" * 64,
+        mode="0644",
+        created_at=AT,
+    )
+    fields.update(overrides)
+    return Record(**fields)
+
+
+def config_record(**overrides) -> Record:
+    fields = dict(
+        id="agent:sdd-verify",
+        kind="config-key",
+        target=CONFIG / "opencode.json",
+        pointer="/agent/sdd-verify",
+        codec="json",
+        after_digest="sha256:" + "b" * 64,
+        created_at=AT,
+    )
+    fields.update(overrides)
+    return Record(**fields)
+
+
+def dependency_record(**overrides) -> Record:
+    fields = dict(
+        id="dependency:some-mcp",
+        kind="dependency-tree",
+        target=HOME / ".local" / "share" / "hpl" / "deps" / "some-mcp" / "1.2.3",
+        after_digest="sha256:" + "d" * 64,
+        created_at=AT,
+    )
+    fields.update(overrides)
+    return Record(**fields)
+
+
+def install(
+    *entries,
+    cli="opencode",
+    links=(),
+    mcp_bindings=None,
+    granted_mcp=None,
+    created_dirs=None,
+    granted_directories=None,
+) -> Install:
+    return Install(
+        cli=cli,
+        installed_at=AT,
+        config_dir=CONFIG,
+        release={"version": "4.0.0", "catalog_digest": "sha256:" + "c" * 64},
+        entries=tuple(entries),
+        links=tuple(links),
+        mcp_bindings=dict(mcp_bindings) if mcp_bindings else {},
+        granted_mcp=tuple(granted_mcp) if granted_mcp else (),
+        created_dirs=tuple(created_dirs) if created_dirs else (),
+        granted_directories=tuple(granted_directories) if granted_directories else (),
+    )
+
+
+class EmptyTest(unittest.TestCase):
+    def test_starts_with_no_installs(self):
+        self.assertEqual(journal_module.empty("4.0.0").installs, ())
+
+    def test_declares_its_schema(self):
+        self.assertEqual(journal_module.empty("4.0.0").schema, "hpl/journal/v4")
+
+
+class RoundTripTest(unittest.TestCase):
+    def setUp(self):
+        self.journal = Journal(hpl_version="4.0.0", installs=(install(record(), config_record()),))
+
+    def test_survives_serialization(self):
+        payload = journal_module.to_dict(self.journal)
+        self.assertEqual(journal_module.from_dict(payload, HOME), self.journal)
+
+    def test_absolute_targets_are_kept(self):
+        """The catalog is portable; the journal records what this machine actually holds."""
+        payload = journal_module.to_dict(self.journal)
+        self.assertEqual(
+            payload["installs"][0]["entries"][0]["target"],
+            "/home/probe/.config/opencode/skills/alpha/SKILL.md",
+        )
+
+    def test_fields_that_do_not_apply_are_omitted(self):
+        payload = journal_module.to_dict(self.journal)
+        entry = payload["installs"][0]["entries"][0]
+        self.assertNotIn("pointer", entry)
+        self.assertNotIn("codec", entry)
+
+    def test_serialization_is_stable(self):
+        self.assertEqual(
+            journal_module.to_dict(self.journal), journal_module.to_dict(self.journal)
+        )
+
+    def test_a_dependency_tree_entry_survives_serialization(self):
+        """A `dependency-tree` entry's target is a directory rather than a
+        file, but the journal itself treats every target the same way — as an
+        absolute path inside the home — so it round-trips like any other."""
+        journal = Journal(hpl_version="4.0.0", installs=(install(dependency_record()),))
+        payload = journal_module.to_dict(journal)
+        self.assertEqual(journal_module.from_dict(payload, HOME), journal)
+
+    def test_a_dependency_trees_program_fields_survive_serialization(self):
+        entry = dependency_record(
+            program_relpath="node_modules/probe-mcp/cli.js", program_digest="sha256:" + "e" * 64
+        )
+        journal = Journal(hpl_version="4.0.0", installs=(install(entry),))
+        payload = journal_module.to_dict(journal)
+        self.assertEqual(journal_module.from_dict(payload, HOME), journal)
+
+    def test_a_dependency_tree_without_program_fields_omits_them(self):
+        """A record predating the program-digest pair must not fabricate
+        either field on the way back out to disk."""
+        payload = journal_module.to_dict(Journal(hpl_version="4.0.0", installs=(install(dependency_record()),)))
+        entry = payload["installs"][0]["entries"][0]
+        self.assertNotIn("program_relpath", entry)
+        self.assertNotIn("program_digest", entry)
+
+    def test_mcp_bindings_survive_serialization(self):
+        journal = Journal(
+            hpl_version="4.0.0",
+            installs=(install(record(), mcp_bindings={"cbm": "codebase-memory-mcp"}),),
+        )
+        payload = journal_module.to_dict(journal)
+        self.assertEqual(journal_module.from_dict(payload, HOME), journal)
+
+    def test_an_install_with_no_bindings_omits_the_key(self):
+        payload = journal_module.to_dict(self.journal)
+        self.assertNotIn("mcp_bindings", payload["installs"][0])
+
+    def test_a_journal_from_before_bindings_existed_still_loads(self):
+        """A journal written by an earlier HPL has no `mcp_bindings` key at
+        all -- that must load exactly as cleanly as one that carries it, and
+        the resulting install must carry an empty mapping rather than raise or
+        invent a key."""
+        payload = journal_module.to_dict(self.journal)
+        self.assertNotIn("mcp_bindings", payload["installs"][0])
+        parsed = journal_module.from_dict(payload, HOME)
+        self.assertEqual(parsed.installs[0].mcp_bindings, {})
+
+    def test_granted_mcp_survives_serialization(self):
+        journal = Journal(
+            hpl_version="4.0.0",
+            installs=(install(record(), granted_mcp=("jira", "figma")),),
+        )
+        payload = journal_module.to_dict(journal)
+        self.assertEqual(journal_module.from_dict(payload, HOME), journal)
+
+    def test_an_install_with_no_granted_mcp_omits_the_key(self):
+        payload = journal_module.to_dict(self.journal)
+        self.assertNotIn("granted_mcp", payload["installs"][0])
+
+    def test_a_journal_from_before_granted_mcp_existed_still_loads(self):
+        """A journal written before `granted_mcp` existed has no such key at
+        all -- that must load exactly as cleanly as one that carries it, and
+        the resulting install must carry an empty tuple rather than raise or
+        invent a key."""
+        payload = journal_module.to_dict(self.journal)
+        self.assertNotIn("granted_mcp", payload["installs"][0])
+        parsed = journal_module.from_dict(payload, HOME)
+        self.assertEqual(parsed.installs[0].granted_mcp, ())
+
+    def test_created_dirs_survives_serialization(self):
+        journal = Journal(
+            hpl_version="4.0.0",
+            installs=(install(record(), created_dirs=(CONFIG / "skills", CONFIG / "skills/alpha")),),
+        )
+        payload = journal_module.to_dict(journal)
+        self.assertEqual(journal_module.from_dict(payload, HOME), journal)
+
+    def test_an_install_with_no_created_dirs_omits_the_key(self):
+        payload = journal_module.to_dict(self.journal)
+        self.assertNotIn("created_dirs", payload["installs"][0])
+
+    def test_a_journal_from_before_created_dirs_existed_still_loads(self):
+        """A journal written before this field existed has no `created_dirs`
+        key at all -- that must load exactly as cleanly as one that carries
+        it, with the resulting install carrying an empty tuple. Empty is also
+        the conservative answer: an install that never recorded what it
+        created must not let a later retirement prune anything at all."""
+        payload = journal_module.to_dict(self.journal)
+        self.assertNotIn("created_dirs", payload["installs"][0])
+        parsed = journal_module.from_dict(payload, HOME)
+        self.assertEqual(parsed.installs[0].created_dirs, ())
+
+    def test_granted_directories_survives_serialization(self):
+        journal = Journal(
+            hpl_version="4.0.0",
+            installs=(install(record(), granted_directories=("/home/probe/worktrees/extra",)),),
+        )
+        payload = journal_module.to_dict(journal)
+        self.assertEqual(journal_module.from_dict(payload, HOME), journal)
+
+    def test_quarantined_directories_survive_a_load_save_load_round_trip_byte_equivalent(self):
+        """The whole point of quarantine: an entry that fails validation is
+        set aside, not lost, and a save-then-reload must hand back the exact
+        same value -- not merely the same count, not promoted into
+        `granted_directories` -- for a mix of a valid entry and several
+        quarantined ones of different JSON shapes."""
+        payload = self.payload_with_granted_directories(
+            ["/home/probe/worktrees/extra", "relative/one", "/", 123, None, {"bad": True}]
+        )
+        first = journal_module.from_dict(payload, HOME)
+        self.assertEqual(first.installs[0].granted_directories, ("/home/probe/worktrees/extra",))
+        self.assertEqual(
+            first.installs[0].quarantined_directories, ("relative/one", "/", 123, None, {"bad": True})
+        )
+        saved = journal_module.to_dict(first)
+        second = journal_module.from_dict(saved, HOME)
+        self.assertEqual(second, first)
+        self.assertEqual(second.installs[0].quarantined_directories, first.installs[0].quarantined_directories)
+
+    def payload_with_granted_directories(self, entries):
+        payload = journal_module.to_dict(self.journal)
+        payload["installs"][0]["granted_directories"] = entries
+        return payload
+
+    def test_an_install_with_no_granted_directories_omits_the_key(self):
+        payload = journal_module.to_dict(self.journal)
+        self.assertNotIn("granted_directories", payload["installs"][0])
+
+    def test_a_journal_from_before_granted_directories_existed_still_loads(self):
+        """A journal written before this field existed has no
+        `granted_directories` key at all -- that must load exactly as cleanly
+        as one that carries it, and the resulting install must carry an empty
+        tuple rather than raise or invent a key."""
+        payload = journal_module.to_dict(self.journal)
+        self.assertNotIn("granted_directories", payload["installs"][0])
+        parsed = journal_module.from_dict(payload, HOME)
+        self.assertEqual(parsed.installs[0].granted_directories, ())
+
+
+class ValidationTest(unittest.TestCase):
+    def payload(self, **overrides):
+        base = journal_module.to_dict(Journal(hpl_version="4.0.0", installs=(install(record()),)))
+        base.update(overrides)
+        return base
+
+    def test_an_unknown_schema_is_refused(self):
+        with self.assertRaises(JournalError) as raised:
+            journal_module.from_dict(self.payload(schema="hpl/journal/v99"), HOME)
+        self.assertIn("v99", str(raised.exception))
+
+    def test_a_target_outside_the_home_is_refused(self):
+        payload = self.payload()
+        payload["installs"][0]["entries"][0]["target"] = "/etc/passwd"
+        with self.assertRaises(JournalError) as raised:
+            journal_module.from_dict(payload, HOME)
+        self.assertIn("/etc/passwd", str(raised.exception))
+
+    def test_a_target_that_climbs_out_with_dot_dot_is_refused(self):
+        """`is_relative_to` compares strings and the kernel resolves paths, so
+        this target reads as contained and lands somewhere else. Retirement
+        deletes what a target names and prunes the directories above it, so a
+        journal that got this past the door would authorise removals outside
+        the home entirely."""
+        payload = self.payload()
+        payload["installs"][0]["entries"][0]["target"] = f"{HOME}/.config/../../elsewhere/loot.md"
+        with self.assertRaises(JournalError) as raised:
+            journal_module.from_dict(payload, HOME)
+        self.assertIn("..", str(raised.exception))
+
+    def test_the_dot_dot_refusal_covers_config_dir_too(self):
+        """The entry and the install's own root are separate doors into the
+        same removals, and a guard on one of them is not a guard."""
+        payload = self.payload()
+        payload["installs"][0]["config_dir"] = f"{HOME}/.config/../../elsewhere"
+        with self.assertRaises(JournalError) as raised:
+            journal_module.from_dict(payload, HOME)
+        self.assertIn("..", str(raised.exception))
+
+    def test_a_created_dir_outside_the_home_is_refused(self):
+        payload = self.payload()
+        payload["installs"][0]["created_dirs"] = ["/etc"]
+        with self.assertRaises(JournalError) as raised:
+            journal_module.from_dict(payload, HOME)
+        self.assertIn("/etc", str(raised.exception))
+
+    def test_a_created_dir_that_climbs_out_with_dot_dot_is_refused(self):
+        """The same door `config_dir` and every `target` are already guarded
+        against: `created_dirs` grants `_prune_empty_directories` the
+        authority to remove a directory, so it needs the identical guard or
+        it is the one door left unlocked."""
+        payload = self.payload()
+        payload["installs"][0]["created_dirs"] = [f"{HOME}/.config/../../elsewhere"]
+        with self.assertRaises(JournalError) as raised:
+            journal_module.from_dict(payload, HOME)
+        self.assertIn("..", str(raised.exception))
+
+    def test_created_dirs_must_be_a_list(self):
+        payload = self.payload()
+        payload["installs"][0]["created_dirs"] = "not-a-list"
+        with self.assertRaises(JournalError):
+            journal_module.from_dict(payload, HOME)
+
+    def test_a_relative_target_is_refused(self):
+        payload = self.payload()
+        payload["installs"][0]["entries"][0]["target"] = "skills/alpha/SKILL.md"
+        with self.assertRaises(JournalError):
+            journal_module.from_dict(payload, HOME)
+
+    def test_a_malformed_digest_is_refused(self):
+        payload = self.payload()
+        payload["installs"][0]["entries"][0]["after_digest"] = "deadbeef"
+        with self.assertRaises(JournalError) as raised:
+            journal_module.from_dict(payload, HOME)
+        self.assertIn("digest", str(raised.exception))
+
+    def test_an_unknown_kind_is_refused(self):
+        payload = self.payload()
+        payload["installs"][0]["entries"][0]["kind"] = "registry-key"
+        with self.assertRaises(JournalError):
+            journal_module.from_dict(payload, HOME)
+
+    def test_a_malformed_program_digest_is_refused(self):
+        payload = self.payload()
+        entry = payload["installs"][0]["entries"][0]
+        entry["program_relpath"] = "cli.js"
+        entry["program_digest"] = "deadbeef"
+        with self.assertRaises(JournalError) as raised:
+            journal_module.from_dict(payload, HOME)
+        self.assertIn("program_digest", str(raised.exception))
+
+    def test_a_program_relpath_that_leaves_the_tree_is_refused(self):
+        """The path is joined onto the tree root, and a join is not a boundary.
+
+        `Path('/deps/cbm/1.0') / '/etc/passwd'` is `/etc/passwd` — the left
+        operand is discarded whole — and a `..` chain walks out the same way.
+        A journal that names either points `doctor`'s tamper check at a file
+        of somebody's choosing: hash a file they control, record its digest
+        here, and the check passes forever while the real tree is never read
+        at all. It is the one input to that check nobody else validates, so it
+        is refused where it is read.
+        """
+        for relpath in ("/etc/passwd", "../../../etc/passwd", "node_modules/../../escape"):
+            with self.subTest(relpath=relpath):
+                payload = self.payload()
+                entry = payload["installs"][0]["entries"][0]
+                entry["program_relpath"] = relpath
+                entry["program_digest"] = "sha256:" + "e" * 64
+                with self.assertRaises(JournalError) as raised:
+                    journal_module.from_dict(payload, HOME)
+                self.assertIn("program_relpath", str(raised.exception))
+
+    def test_an_empty_program_relpath_is_refused(self):
+        payload = self.payload()
+        entry = payload["installs"][0]["entries"][0]
+        entry["program_relpath"] = ""
+        entry["program_digest"] = "sha256:" + "a" * 64
+        with self.assertRaises(JournalError) as raised:
+            journal_module.from_dict(payload, HOME)
+        self.assertIn("program_relpath", str(raised.exception))
+
+    def test_a_journal_from_before_this_pair_existed_still_loads(self):
+        """Neither field is a plain absence, not a defect -- an entry with no
+        knowledge of the program-digest pair at all must load exactly as
+        cleanly as it did before the pair was invented."""
+        payload = self.payload()
+        parsed = journal_module.from_dict(payload, HOME)
+        entry = parsed.installs[0].entries[0]
+        self.assertIsNone(entry.program_relpath)
+        self.assertIsNone(entry.program_digest)
+
+    def test_a_dependency_tree_kind_is_accepted(self):
+        payload = journal_module.to_dict(Journal(hpl_version="4.0.0", installs=(install(dependency_record()),)))
+        journal_module.from_dict(payload, HOME)  # raises on failure
+
+    def test_ownership_other_than_owned_is_refused(self):
+        payload = self.payload()
+        payload["installs"][0]["entries"][0]["ownership"] = "borrowed"
+        with self.assertRaises(JournalError):
+            journal_module.from_dict(payload, HOME)
+
+    def test_a_link_must_declare_it_is_not_owned(self):
+        payload = journal_module.to_dict(
+            Journal(hpl_version="4.0.0", installs=(install(links=(Link(id="cbm", target="/usr/bin/cbm"),)),))
+        )
+        payload["installs"][0]["links"][0]["ownership"] = "owned"
+        with self.assertRaises(JournalError) as raised:
+            journal_module.from_dict(payload, HOME)
+        self.assertIn("non-owning-link", str(raised.exception))
+
+    def test_two_installs_for_one_cli_are_refused(self):
+        payload = journal_module.to_dict(
+            Journal(hpl_version="4.0.0", installs=(install(record()), install(record())))
+        )
+        with self.assertRaises(JournalError) as raised:
+            journal_module.from_dict(payload, HOME)
+        self.assertIn("opencode", str(raised.exception))
+
+    def test_granted_mcp_must_be_a_list(self):
+        payload = self.payload()
+        payload["installs"][0]["granted_mcp"] = {"jira": True}
+        with self.assertRaises(JournalError) as raised:
+            journal_module.from_dict(payload, HOME)
+        self.assertIn("opencode", str(raised.exception))
+
+    def test_granted_mcp_entries_must_be_non_empty_strings(self):
+        payload = self.payload()
+        payload["installs"][0]["granted_mcp"] = ["jira", ""]
+        with self.assertRaises(JournalError) as raised:
+            journal_module.from_dict(payload, HOME)
+        self.assertIn("granted_mcp", str(raised.exception))
+
+    def test_granted_mcp_entries_shaped_like_a_wildcard_are_refused(self):
+        """The same escalation `content.grant_mcp` refuses at grant time must
+        also be refused on replay -- a hand-edited or corrupted journal must
+        not be able to smuggle a wildcard-shaped key past a CLI check that
+        only ever runs once, at the moment a person types `mcp grant`."""
+        for spelling in ["*", "a*", "**", "   ", "a/b", 'a"b', "a=b"]:
+            with self.subTest(spelling=spelling):
+                payload = self.payload()
+                payload["installs"][0]["granted_mcp"] = [spelling]
+                with self.assertRaises(JournalError) as raised:
+                    journal_module.from_dict(payload, HOME)
+                self.assertIn("opencode", str(raised.exception))
+
+    def test_granted_mcp_entries_with_a_legitimate_shape_still_load(self):
+        for spelling in ["jira", "figma-developer-mcp", "some.server_1"]:
+            with self.subTest(spelling=spelling):
+                payload = self.payload()
+                payload["installs"][0]["granted_mcp"] = [spelling]
+                parsed = journal_module.from_dict(payload, HOME)
+                self.assertEqual(parsed.installs[0].granted_mcp, (spelling,))
+
+    def test_granted_directories_must_be_a_list(self):
+        """Not-a-list is a different corruption from a bad element: there is
+        no per-element structure to quarantine, so this still refuses the
+        whole journal exactly as before."""
+        payload = self.payload()
+        payload["installs"][0]["granted_directories"] = {"a": True}
+        with self.assertRaises(JournalError) as raised:
+            journal_module.from_dict(payload, HOME)
+        self.assertIn("opencode", str(raised.exception))
+
+    def test_granted_directories_relative_entries_are_quarantined(self):
+        payload = self.payload()
+        payload["installs"][0]["granted_directories"] = ["worktrees/extra"]
+        parsed = journal_module.from_dict(payload, HOME)
+        self.assertEqual(parsed.installs[0].granted_directories, ())
+        self.assertEqual(parsed.installs[0].quarantined_directories, ("worktrees/extra",))
+
+    def test_granted_directories_entries_that_climb_with_dot_dot_are_quarantined(self):
+        payload = self.payload()
+        payload["installs"][0]["granted_directories"] = ["/home/probe/worktrees/../../etc"]
+        parsed = journal_module.from_dict(payload, HOME)
+        self.assertEqual(parsed.installs[0].granted_directories, ())
+        self.assertEqual(
+            parsed.installs[0].quarantined_directories, ("/home/probe/worktrees/../../etc",)
+        )
+
+    def test_granted_directories_root_is_quarantined(self):
+        payload = self.payload()
+        payload["installs"][0]["granted_directories"] = ["/"]
+        parsed = journal_module.from_dict(payload, HOME)
+        self.assertEqual(parsed.installs[0].granted_directories, ())
+        self.assertEqual(parsed.installs[0].quarantined_directories, ("/",))
+
+    def test_granted_directories_the_configuration_directory_and_its_ancestors_are_quarantined(self):
+        """The same escalation `content.grant_directories` refuses at grant
+        time must still be refused on replay -- a hand-edited or corrupted
+        journal must not be able to smuggle the settings directory past a
+        check that only ever runs once, at the moment a person types
+        `directory grant`. It no longer blocks the whole journal, though:
+        the entry is set aside instead, granting nothing."""
+        for candidate in (str(CONFIG), str(CONFIG.parent), "/home/probe"):
+            with self.subTest(candidate=candidate):
+                payload = self.payload()
+                payload["installs"][0]["granted_directories"] = [candidate]
+                parsed = journal_module.from_dict(payload, HOME)
+                self.assertEqual(parsed.installs[0].granted_directories, ())
+                self.assertEqual(parsed.installs[0].quarantined_directories, (candidate,))
+
+    def test_granted_directories_of_any_json_type_are_quarantined_not_fatal(self):
+        """Quarantine has to hold for an entry of any JSON shape, not only a
+        malformed string -- `validate_granted_directory`'s own first check
+        already refuses anything that is not a non-empty string, and that
+        refusal must land the same way every other one does: set aside,
+        never fatal to the load."""
+        for candidate in (123, None, {"a": 1}, [], True, 4.5):
+            with self.subTest(candidate=candidate):
+                payload = self.payload()
+                payload["installs"][0]["granted_directories"] = [candidate]
+                parsed = journal_module.from_dict(payload, HOME)
+                self.assertEqual(parsed.installs[0].granted_directories, ())
+                self.assertEqual(parsed.installs[0].quarantined_directories, (candidate,))
+
+    def test_granted_directories_outside_the_home_still_load(self):
+        """Deliberately not checked against `home` the way every other path
+        this journal holds is -- a legitimate working directory can sit
+        anywhere on the machine."""
+        payload = self.payload()
+        payload["installs"][0]["granted_directories"] = ["/srv/worktrees/extra"]
+        parsed = journal_module.from_dict(payload, HOME)
+        self.assertEqual(parsed.installs[0].granted_directories, ("/srv/worktrees/extra",))
+
+    def test_granted_directories_the_hpl_data_directory_and_its_ancestors_are_quarantined_when_data_dir_is_given(
+        self,
+    ):
+        """The same replay-escalation guard `config_dir` already gets must
+        also cover HPL's own data directory -- a hand-edited journal
+        must not be able to smuggle write access to the journal's own home
+        past a check that only ever runs once, at the moment a person types
+        `directory grant`. As with `config_dir`, the refusal to *grant* is
+        unchanged; only the fatal-load behaviour is gone."""
+        for candidate in (str(DATA_DIR), str(DATA_DIR.parent)):
+            with self.subTest(candidate=candidate):
+                payload = self.payload()
+                payload["installs"][0]["granted_directories"] = [candidate]
+                parsed = journal_module.from_dict(payload, HOME, data_dir=DATA_DIR)
+                self.assertEqual(parsed.installs[0].granted_directories, ())
+                self.assertEqual(parsed.installs[0].quarantined_directories, (candidate,))
+
+    def test_granted_directories_the_hpl_data_directory_still_loads_without_data_dir(self):
+        """`data_dir` is optional: a caller with no `FileSystem` port to ask
+        -- most callers of `from_dict` in this suite -- gets the structural
+        checks only, not this one extra refusal."""
+        payload = self.payload()
+        payload["installs"][0]["granted_directories"] = [str(DATA_DIR)]
+        parsed = journal_module.from_dict(payload, HOME)
+        self.assertEqual(parsed.installs[0].granted_directories, (str(DATA_DIR),))
+
+    def test_granted_directories_beside_the_hpl_data_directory_still_load(self):
+        payload = self.payload()
+        sibling = str(DATA_DIR.parent / "other-app")
+        payload["installs"][0]["granted_directories"] = [sibling]
+        parsed = journal_module.from_dict(payload, HOME, data_dir=DATA_DIR)
+        self.assertEqual(parsed.installs[0].granted_directories, (sibling,))
+
+    def test_granted_directories_not_a_list_error_names_the_field(self):
+        """The one remaining fatal shape -- `granted_directories` itself not
+        being a list -- still names the field in its complaint."""
+        payload = self.payload()
+        payload["installs"][0]["granted_directories"] = "not-a-list"
+        with self.assertRaises(JournalError) as raised:
+            journal_module.from_dict(payload, HOME)
+        self.assertIn("granted_directories", str(raised.exception))
+
+    def test_a_config_key_entry_needs_a_pointer(self):
+        payload = self.payload()
+        payload["installs"][0]["entries"][0]["kind"] = "config-key"
+        with self.assertRaises(JournalError) as raised:
+            journal_module.from_dict(payload, HOME)
+        self.assertIn("pointer", str(raised.exception))
+
+
+class InstallsTest(unittest.TestCase):
+    def test_installs_are_kept_per_cli(self):
+        journal = journal_module.empty("4.0.0")
+        journal = journal_module.with_install(journal, install(record()))
+        journal = journal_module.with_install(journal, install(record(), cli="other"))
+        self.assertEqual([item.cli for item in journal.installs], ["opencode", "other"])
+
+    def test_installing_again_replaces_the_previous_record(self):
+        journal = journal_module.with_install(journal_module.empty("4.0.0"), install(record()))
+        journal = journal_module.with_install(journal, install(record(), config_record()))
+        self.assertEqual(len(journal.installs), 1)
+        self.assertEqual(len(journal.installs[0].entries), 2)
+
+    def test_finds_an_install_by_cli(self):
+        journal = journal_module.with_install(journal_module.empty("4.0.0"), install(record()))
+        self.assertEqual(journal_module.install_for(journal, "opencode").cli, "opencode")
+        self.assertIsNone(journal_module.install_for(journal, "nope"))
+
+    def test_removing_an_install_leaves_the_others(self):
+        journal = journal_module.with_install(journal_module.empty("4.0.0"), install(record()))
+        journal = journal_module.with_install(journal, install(record(), cli="other"))
+        journal = journal_module.without_install(journal, "opencode")
+        self.assertEqual([item.cli for item in journal.installs], ["other"])
+
+
+class LegacyPayloadTest(unittest.TestCase):
+    """A journal written by an earlier engine may carry fields this one no longer uses.
+
+    Parsing is additive: it reads what it needs from a dict and never checks the
+    dict is exactly that shape, so a key from a retired feature is silently
+    dropped rather than rejected.
+    """
+
+    def test_before_adopted_and_mutations_are_ignored_rather_than_rejected(self):
+        payload = journal_module.to_dict(Journal(hpl_version="4.0.0", installs=(install(config_record()),)))
+        entry = payload["installs"][0]["entries"][0]
+        entry["before"] = {"model": "someone/else"}
+        entry["adopted"] = True
+        entry["mutations"] = [{"at": AT, "by": "set-model", "after_digest": "sha256:" + "d" * 64}]
+
+        parsed = journal_module.from_dict(payload, HOME)
+
+        entry = parsed.installs[0].entries[0]
+        self.assertFalse(hasattr(entry, "before"))
+        self.assertFalse(hasattr(entry, "adopted"))
+        self.assertFalse(hasattr(entry, "mutations"))
+
+
+if __name__ == "__main__":
+    unittest.main()

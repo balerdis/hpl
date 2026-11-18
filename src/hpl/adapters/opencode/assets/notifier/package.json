@@ -1,0 +1,7 @@
+{
+  "name": "{{program_npm_name}}-opencode-notifier",
+  "private": true,
+  "dependencies": {
+    "@mohak34/opencode-notifier": "0.2.4"
+  }
+}

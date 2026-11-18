@@ -1,0 +1,7 @@
+"""HPL: one content core, one adapter per CLI."""
+from __future__ import annotations
+
+__version__ = "7.7.8"
+"""The release this package is. A test keeps it equal to pyproject.toml and to
+HPL's own shipped identity.json (`identity.version`) -- three sources of
+truth this exact number, not two."""

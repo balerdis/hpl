@@ -1,0 +1,2629 @@
+"""The flags, and the report they produce.
+
+The rule the architecture sets is parity: the TUI must not be able to do
+anything the flags cannot. That makes this the surface an agent drives, so its
+output is a contract and not a convenience — every number in it has to be true,
+including the uncomfortable ones.
+
+**Real disk, mostly.** Every test in this module runs against a throwaway home
+and the real `PosixFileSystem`, via `RealHomeTestCase`. The one exception is
+`WriteRefusalTest`: a process that may not write on the home owner's behalf
+— running as root, or a home belonging to somebody else — has no honest
+real-disk equivalent short of actually being one of those, so those cases
+stay on `FakeFileSystem`.
+
+**Why detection is still half real.** Writing goes through the filesystem
+port, which is now real, but detection does not: an adapter answers
+``detect`` with ``shutil.which`` and a real ``is_dir`` check, so it looks at
+the machine the tests run on no matter what the port is told. Rather than
+paper over that, these tests give the runtime an empty ``PATH`` and rely on
+the throwaway home's config directory being absent (or created by
+``present()``) to drive detection deterministically. The mismatch is a known
+wrinkle in the architecture, not something this module invents.
+"""
+from __future__ import annotations
+
+import contextlib
+import io
+import json
+import os
+import stat
+import sys
+import tempfile
+import tomllib
+import unittest
+from unittest import mock
+from dataclasses import replace
+from pathlib import Path
+from typing import Callable
+
+import hpl
+from fakes import FakeFileSystem
+from hpl import cli
+from hpl.adapters import available
+from hpl.core import content as content_module
+from hpl.core import journal as journal_module
+from hpl.core import model_assignments as model_assignments_module
+from hpl.core import identity as identity_module
+from hpl.core import ownership
+from hpl.core import planner
+from hpl.core.types import Environment, ModelAssignment
+from hpl.infra.journal_store_file import journal_path
+from hpl.infra.snapshot_store_file import snapshots_root
+from platform_conditions import (
+    fail_probe_once_it_exists,
+    make_undeletable,
+    make_unreadable,
+    make_unwritable,
+)
+from real_home import RealHomeTestCase as _RealHomeTestCase
+from recording_filesystem import RecordingFileSystem
+
+AT = "2026-08-14T00:00:00+00:00"
+# Pinned to OpenCode, not "whichever adapter is registered first": this
+# suite exercises capabilities (mcp, per_agent_model, subagents declared
+# inside the settings file, ...) that only OpenCode declares today. Since
+# Claude Code registered, "available().ids()[0]" resolves alphabetically
+# to "claudecode" instead, which cannot support what this file tests.
+CLI = "opencode"
+NO_BINARY = {"PATH": ""}
+
+
+def cli_entry(report, cli_id: str = CLI):
+    """`report["clis"][index]`'s entry for `cli_id`, never a positional index.
+
+    `doctor`'s report lists every registered adapter, sorted by id, so index
+    0 stopped meaning "the CLI this test just installed" the moment a second
+    adapter registered: it now names whichever id sorts first alphabetically,
+    which need not be `CLI`. Every `doctor` test that installs one CLI and
+    inspects its own entry goes through this helper instead, so it keeps
+    naming the right entry regardless of how many adapters register.
+    """
+    return next(entry for entry in report["clis"] if entry["cli"] == cli_id)
+
+
+class RealHomeTestCase(_RealHomeTestCase):
+    """The generic real-home base plus what only the CLI surface needs.
+
+    The throwaway home and the real POSIX filesystem come from the shared
+    base; everything below is specific to driving `cli.main` and to proving
+    facts about what it did or did not do to the real disk underneath it.
+    """
+
+    def runtime(self, *, identity=None) -> cli.Runtime:
+        kwargs = {} if identity is None else {"identity": identity}
+        return cli.Runtime(
+            filesystem=self.filesystem, home=self.home, now=AT, out=io.StringIO(), variables=NO_BINARY, **kwargs
+        )
+
+    def layout(self):
+        return available().get(CLI).layout(Environment(home=self.home))
+
+    def present(self) -> None:
+        """Make the adapter find the CLI's configuration directory."""
+        self.layout().config_dir.mkdir(parents=True, exist_ok=True)
+
+    def store(self, *, identity=None):
+        return cli.journal_store(self.runtime(identity=identity))
+
+    def run_cli(self, *argv, identity=None) -> tuple[int, dict]:
+        context = self.runtime(identity=identity)
+        code = cli.main([*argv, "--json"], runtime=context)
+        return code, json.loads(context.out.getvalue())
+
+    def run_prose(self, *argv) -> tuple[int, str]:
+        context = self.runtime()
+        code = cli.main(list(argv), runtime=context)
+        return code, context.out.getvalue()
+
+    def installed_entries(self):
+        return journal_module.install_for(self.store().load(), CLI).entries
+
+    def snapshot(self) -> dict[Path, bytes]:
+        """Every real file under the throwaway home, keyed by path — the
+        disk equivalent of the double's ``files`` dict, for tests that used
+        to compare that dict before and after a run."""
+        return {path: path.read_bytes() for path in self.home.rglob("*") if path.is_file()}
+
+    def assert_no_artifacts_written(self) -> None:
+        """No file landed under the CLI's own configuration directory."""
+        self.assertEqual([path for path in self.layout().config_dir.rglob("*") if path.is_file()], [])
+
+    def assert_disk_untouched(self) -> None:
+        """Nothing this command could have written reached disk at all: no
+        artifact, no journal, no snapshot generation."""
+        self.assert_no_artifacts_written()
+        self.assertFalse(journal_path(self.filesystem, self.home).exists())
+        self.assertFalse(snapshots_root(self.filesystem, self.home).exists())
+
+    def make_journal_unwritable(self) -> Callable[[], None]:
+        """Make the directory holding the journal refuse a write — the
+        honest equivalent of the double's ``fail_always.add(store().path)``:
+        a real directory has no way to refuse one specific file while
+        accepting everything else beside it, so this refuses the whole
+        directory, which is what the journal store's own write goes through
+        regardless.
+
+        The snapshots directory is created first, same as
+        `refuse_to_write_the_journal`: it shares this same parent, and a run
+        that reaches the journal has already taken its preflight snapshot,
+        which needs to create a fresh generation folder *inside* it. Locking
+        the parent after that folder already exists leaves the ability to
+        write inside it untouched, and only refuses a new entry directly in
+        the parent — which is exactly the journal file.
+        """
+        snapshots_root(self.filesystem, self.home).mkdir(parents=True, exist_ok=True)
+        return make_unwritable(self.store().path.parent)
+
+    def refuse_to_write_the_journal(self) -> None:
+        """Make the journal write fail with real permissions, and only it.
+
+        The snapshots directory is created first and left writable, so the
+        preflight snapshot still succeeds and the run actually reaches the
+        journal — which is the whole point, since the report being tested is
+        the one a journal failure produces after the artifacts are already
+        placed.
+        """
+        snapshots_root(self.filesystem, self.home).mkdir(parents=True, exist_ok=True)
+        data_dir = journal_path(self.filesystem, self.home).parent
+        self.addCleanup(make_unwritable(data_dir))
+
+    def refuse_to_probe_once_it_exists(self, path: Path) -> None:
+        self.addCleanup(fail_probe_once_it_exists(path))
+
+
+class FakeHomeTestCase(unittest.TestCase):
+    """Only for what no real condition can produce.
+
+    "Running as root" and "a home owned by someone else" are facts
+    `PosixFileSystem` reads straight off the operating system —
+    ``running_privileged`` from ``os.geteuid()``, ``owned_by_current_user``
+    from the file's real owner — and neither can be faked from inside a test
+    without actually being root, or actually being another user. Every other
+    test in this module runs on real disk; these stay on the double because
+    there is no honest way to move them.
+    """
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.home = Path(self.directory.name)
+        self.filesystem = FakeFileSystem()
+
+    def runtime(self) -> cli.Runtime:
+        return cli.Runtime(
+            filesystem=self.filesystem, home=self.home, now=AT, out=io.StringIO(), variables=NO_BINARY
+        )
+
+    def layout(self):
+        return available().get(CLI).layout(Environment(home=self.home))
+
+    def present(self) -> None:
+        self.layout().config_dir.mkdir(parents=True, exist_ok=True)
+
+    def run_cli(self, *argv) -> tuple[int, dict]:
+        context = self.runtime()
+        code = cli.main([*argv, "--json"], runtime=context)
+        return code, json.loads(context.out.getvalue())
+
+
+class VersionTest(unittest.TestCase):
+    """Three places now hold HPL's own version -- `pyproject.toml`,
+    `hpl.__version__`, and HPL's own shipped `identity.json` -- and
+    all three must agree, never just the first two. This does NOT generalise
+    to an arbitrary distribution's `identity.json`: a distribution legitimately
+    pins the engine at one version and releases its own product under a
+    completely different one (the whole point of the fix this test
+    accompanies) -- this three-way rule is only about the identity HPL
+    ships for itself.
+    """
+
+    def test_the_package_version_matches_the_project_metadata(self):
+        """Two places holding one number is how a release starts lying about itself."""
+        metadata = tomllib.loads(Path(__file__).resolve().parents[1].joinpath("pyproject.toml").read_text())
+        self.assertEqual(hpl.__version__, metadata["project"]["version"])
+
+    def test_hpl_own_identity_json_agrees_with_the_package_version(self):
+        real_identity_path = Path(__file__).resolve().parents[1] / "src" / "hpl" / "identity.json"
+        own_identity = identity_module.parse(real_identity_path.read_bytes())
+        self.assertEqual(own_identity.version, hpl.__version__)
+
+
+class VersionFlagTest(unittest.TestCase):
+    """Asking a program what version it is should not require diagnosing it.
+
+    The number was reachable only through `hpl doctor --json`, which opens
+    a home, reads a journal and reports on an installation — a great deal of
+    work, and a different question, to answer one that is about the binary and
+    nothing else. It is also the number a person reads out when reporting a
+    problem, so the cost of it being hard to get is paid at the worst moment.
+    """
+
+    def run_flag(self, flag: str) -> tuple[int, str]:
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            try:
+                code = cli.main([flag])
+            except SystemExit as exit_code:
+                code = exit_code.code or 0
+        return code, out.getvalue()
+
+    def test_version_is_reported_and_exits_cleanly(self):
+        code, printed = self.run_flag("--version")
+        self.assertEqual(code, 0)
+        self.assertIn(hpl.__version__, printed)
+
+    def test_the_short_spelling_answers_the_same(self):
+        self.assertEqual(self.run_flag("-V")[1], self.run_flag("--version")[1])
+
+    def test_it_is_not_accepted_after_a_subcommand_and_that_is_deliberate(self):
+        """`--json` is accepted on either side because it modifies a report.
+        A version request modifies nothing: it is its own command, and
+        `hpl install --cli x --version` printing a number instead of
+        installing would be a surprising way to not install something. So it
+        is refused there, and argparse's own usage line names where it goes.
+        """
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            with self.assertRaises(SystemExit) as exit_code:
+                cli.main(["doctor", "--version"])
+        self.assertEqual(exit_code.exception.code, 2)
+        self.assertIn("--version", err.getvalue())
+
+    def test_it_needs_no_home_and_no_journal(self):
+        """It is answered by the parser, before anything opens a file. A
+        version that depended on an installation would fail exactly where it
+        is most needed: on a machine where the installation is broken.
+        """
+        code, printed = self.run_flag("--version")
+        self.assertEqual(code, 0)
+        self.assertEqual(printed.strip().split()[-1], hpl.__version__)
+
+
+#: An obviously fictional distribution -- never a real organization -- pinning this engine at
+#: one version while releasing its own product under a different one, mirroring a real
+#: distribution's own build (the engine at one version, the product tagged at another).
+_DISTRIBUTION_IDENTITY_PAYLOAD = {
+    "product_id": "nova-cli",
+    "display_name": "Nova",
+    "program_name": "nova",
+    "version": "1.0.0",
+    "wordmark_words": ["NOVA"],
+    "release": {
+        "asset_url_template": "https://example.invalid/nova/releases/download/{tag}/{asset}",
+        "binary_asset": "nova",
+        "latest_release_api_url": "https://example.invalid/nova/api/releases/latest",
+        "release_page_url": "https://example.invalid/nova/releases",
+        "install_base_url_default": "https://example.invalid/nova/releases/latest/download",
+    },
+}
+
+
+class DistributionVersionFlagTest(unittest.TestCase):
+    """`--version` must report a distribution's own version -- from its own
+    `identity.json` -- never the pinned engine's `hpl.__version__`. This
+    is the exact defect a real distribution hit: `nova --version` printed
+    `nova 5.19.0`, the engine's own baked-in constant, instead of `nova
+    1.0.0`, the product's own release."""
+
+    def test_a_distributions_version_flag_reports_its_own_version_not_the_engines(self):
+        distribution_identity = identity_module.parse(json.dumps(_DISTRIBUTION_IDENTITY_PAYLOAD).encode("utf-8"))
+        self.assertNotEqual(distribution_identity.version, hpl.__version__)
+        runtime = cli.Runtime(
+            filesystem=FakeFileSystem(), home=Path("/home/person"), now=AT, out=io.StringIO(), variables={},
+            identity=distribution_identity,
+        )
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            with self.assertRaises(SystemExit) as exit_code:
+                cli.main(["--version"], runtime=runtime)
+        self.assertEqual(exit_code.exception.code, 0)
+        printed = out.getvalue()
+        self.assertIn("nova 1.0.0", printed)
+        self.assertNotIn(hpl.__version__, printed)
+
+
+class ArgumentTest(RealHomeTestCase):
+    def test_no_command_without_a_terminal_is_an_error_rather_than_a_silent_success(self):
+        """Asking for nothing at a terminal opens the menu, but piped or
+        redirected there is no menu to show and nobody to read it — and a
+        script that reached here by mistake needs to be told."""
+        self.assertNotEqual(cli.main([], runtime=self.runtime()), 0)
+
+    def test_an_unknown_cli_is_refused_and_named(self):
+        code, report = self.run_cli("install", "--cli", "nonesuch")
+        self.assertNotEqual(code, 0)
+        self.assertEqual(report["status"], "failed")
+        self.assertIn("nonesuch", report["error"])
+
+    def test_json_is_honoured_on_either_side_of_the_subcommand(self):
+        """A flag that silently does nothing is worse than one that is rejected."""
+        self.present()
+        for argv in (["doctor", "--json"], ["--json", "doctor"]):
+            with self.subTest(argv=argv):
+                context = self.runtime()
+                cli.main(argv, runtime=context)
+                self.assertEqual(json.loads(context.out.getvalue())["command"], "doctor")
+
+    def test_every_report_declares_its_schema_and_command(self):
+        self.present()
+        for argv in (("doctor",), ("install", "--cli", CLI), ("uninstall", "--cli", CLI)):
+            with self.subTest(argv=argv):
+                _, report = self.run_cli(*argv)
+                self.assertEqual(report["schema"], cli.SCHEMA)
+                self.assertEqual(report["command"], argv[0])
+
+
+class InstallTest(RealHomeTestCase):
+    def test_installing_into_a_clean_home_reports_what_it_created(self):
+        self.present()
+        code, report = self.run_cli("install", "--cli", CLI)
+        self.assertEqual(code, 0)
+        self.assertEqual(report["status"], "installed")
+        self.assertTrue(report["created"])
+        self.assertEqual(report["skipped"], [])
+
+    def test_installing_writes_the_journal(self):
+        self.present()
+        self.run_cli("install", "--cli", CLI)
+        self.assertIsNotNone(journal_module.install_for(self.store().load(), CLI))
+
+    def test_no_recorded_created_directory_is_missing_from_the_disk(self):
+        """`created_dirs` claims "these exist because we created them", and the
+        claim has to survive the run that prunes one of them.
+
+        Merging the record forward is what keeps a directory created by one run
+        prunable when a later run empties it, but union alone never subtracts,
+        so a pruned path stayed in the record naming a directory that was gone.
+        Two harms, not one: the record asserted something false about the disk,
+        and it stayed claimable -- recreate that directory by hand, let HPL
+        write into it again, and retirement would prune a directory this
+        installation never created.
+
+        Derived from the record against the real disk rather than from the one
+        path this happened to reproduce with, so any other way of going stale
+        fails here too.
+        """
+        self.present()
+        other = identity_module.parse(json.dumps(_DISTRIBUTION_IDENTITY_PAYLOAD).encode("utf-8"))
+        self.run_cli("install", "--cli", CLI, "--mcp", "none")
+        # Reinstalling under another identity renames the artifacts whose names
+        # derive from it, which empties the subtree the old name held -- the
+        # shortest route to a prune that goes through the real CLI surface.
+        _, report = self.run_cli("install", "--cli", CLI, "--mcp", "none", identity=other)
+        self.assertTrue(report["pruned"], "the run has to actually prune something to be a test")
+
+        recorded = journal_module.install_for(self.store(identity=other).load(), CLI).created_dirs
+        self.assertTrue(recorded)
+        self.assertEqual([path for path in recorded if not path.exists()], [])
+
+    def test_a_directory_pruned_by_this_run_leaves_the_record(self):
+        self.present()
+        other = identity_module.parse(json.dumps(_DISTRIBUTION_IDENTITY_PAYLOAD).encode("utf-8"))
+        self.run_cli("install", "--cli", CLI, "--mcp", "none")
+        _, report = self.run_cli("install", "--cli", CLI, "--mcp", "none", identity=other)
+        self.assertTrue(report["pruned"], "the run has to actually prune something to be a test")
+
+        config_dir = self.layout().config_dir
+        recorded = journal_module.install_for(self.store(identity=other).load(), CLI).created_dirs
+        for relative in report["pruned"]:
+            self.assertNotIn(config_dir / relative, recorded)
+
+    def test_installing_reports_the_directories_it_pruned(self):
+        """`install`/`update` retire what a re-render no longer asks for the
+        same way `uninstall` retires everything -- see the `planner.retire`
+        call in `install()` -- but used to drop `Retired.pruned` on the
+        floor instead of reporting it, the one thing `uninstall`'s own report
+        has always carried."""
+        self.present()
+        self.run_cli("install", "--cli", CLI)
+        code, report = self.run_cli("install", "--cli", CLI)
+        self.assertEqual(code, 0)
+        self.assertIn("pruned", report)
+        self.assertIsInstance(report["pruned"], list)
+
+    def test_the_journal_records_the_release_that_placed_the_artifacts(self):
+        self.present()
+        self.run_cli("install", "--cli", CLI)
+        install = journal_module.install_for(self.store().load(), CLI)
+        self.assertEqual(install.release["version"], hpl.__version__)
+        self.assertTrue(install.release["catalog_digest"].startswith("sha256:"))
+        self.assertEqual(install.installed_at, AT)
+
+    def test_a_distributions_journal_records_its_own_version_not_the_engines(self):
+        """Regression: `Install.release["version"]` used to be
+        `hpl.__version__` unconditionally -- so an installation made by a
+        distribution recorded the pinned engine's own version, never the
+        product's own release, in the very record the TUI's own update
+        notice later compares the running version against."""
+        distribution_identity = identity_module.parse(
+            json.dumps(_DISTRIBUTION_IDENTITY_PAYLOAD).encode("utf-8")
+        )
+        self.assertNotEqual(distribution_identity.version, hpl.__version__)
+        self.present()
+        self.run_cli("install", "--cli", CLI, identity=distribution_identity)
+        install = journal_module.install_for(self.store().load(), CLI)
+        self.assertEqual(install.release["version"], distribution_identity.version)
+
+    def test_reinstalling_does_not_erase_what_the_journal_already_owned(self):
+        """The second run creates nothing — everything it wants is its own work
+        from the first run. Writing that empty result over the journal would
+        orphan all 84 artifacts permanently, with nothing left to prove they
+        were ever ours."""
+        self.present()
+        self.run_cli("install", "--cli", CLI)
+        owned = {entry.id for entry in self.installed_entries()}
+        self.assertTrue(owned)
+        self.run_cli("install", "--cli", CLI)
+        self.assertEqual({entry.id for entry in self.installed_entries()}, owned)
+
+    def test_what_was_installed_can_still_be_taken_back_after_reinstalling(self):
+        self.present()
+        self.run_cli("install", "--cli", CLI)
+        self.run_cli("install", "--cli", CLI)
+        _, report = self.run_cli("uninstall", "--cli", CLI)
+        self.assertTrue(report["removed"])
+
+    def test_reinstalling_keeps_the_date_hpl_first_landed(self):
+        self.present()
+        self.run_cli("install", "--cli", CLI)
+        later = cli.Runtime(
+            filesystem=self.filesystem, home=self.home, now="2027-01-01T00:00:00+00:00",
+            out=io.StringIO(), variables=NO_BINARY,
+        )
+        cli.main(["install", "--cli", CLI, "--json"], runtime=later)
+        self.assertEqual(journal_module.install_for(self.store().load(), CLI).installed_at, AT)
+
+    def test_reinstalling_the_same_payload_reports_no_work(self):
+        """The second run is not a wall of collisions any more; it is a no-op."""
+        self.present()
+        self.run_cli("install", "--cli", CLI)
+        _, report = self.run_cli("install", "--cli", CLI)
+        self.assertEqual(report["created"], [])
+        self.assertEqual(report["updated"], [])
+        self.assertEqual(report["skipped"], [])
+        self.assertTrue(report["unchanged"])
+
+    def test_a_file_the_user_edited_is_overwritten_by_a_reinstall(self):
+        self.present()
+        self.run_cli("install", "--cli", CLI)
+        target = self.layout().system_prompt_file
+        original = target.read_bytes()
+        target.write_bytes(b"the user's own words\n")
+        _, report = self.run_cli("install", "--cli", CLI)
+        self.assertIn("system-prompt:hpl-AGENTS.md", [item["id"] for item in report["updated"]])
+        self.assertEqual(target.read_bytes(), original)
+
+    def test_the_prose_names_what_it_updated(self):
+        self.present()
+        self.run_cli("install", "--cli", CLI)
+        code, out = self.run_prose("install", "--cli", CLI)
+        self.assertEqual(code, 0)
+        self.assertIn("updated 0", out)
+        self.assertIn("already current", out)
+
+    def test_a_dry_run_reports_the_plan_and_touches_nothing(self):
+        self.present()
+        code, report = self.run_cli("install", "--cli", CLI, "--dry-run")
+        self.assertEqual(code, 0)
+        self.assertEqual(report["status"], "planned")
+        self.assertTrue(report["created"])
+        self.assert_disk_untouched()
+
+    def test_installing_where_the_cli_is_absent_is_refused(self):
+        """Installing into a CLI the user does not have would just leave litter."""
+        code, report = self.run_cli("install", "--cli", CLI)
+        self.assertNotEqual(code, 0)
+        self.assertEqual(report["status"], "failed")
+        self.assert_disk_untouched()
+
+    # --- Refusing before doing ---
+
+    def test_an_install_that_cannot_be_recorded_is_taken_back_out(self):
+        """An installation nobody recorded is one nobody can uninstall."""
+        self.present()
+        self.addCleanup(self.make_journal_unwritable())
+        code, report = self.run_cli("install", "--cli", CLI)
+        self.assertNotEqual(code, 0)
+        self.assertEqual(report["status"], "failed")
+        self.assertTrue(report["rolled_back"])
+        left = [path for path in self.layout().config_dir.rglob("*") if path.is_file()]
+        self.assertEqual(left, [self.layout().settings_file])
+
+    def test_an_install_that_cannot_be_recorded_reports_directories_the_rollback_pruned(self):
+        self.present()
+        self.addCleanup(self.make_journal_unwritable())
+        code, report = self.run_cli("install", "--cli", CLI)
+        self.assertNotEqual(code, 0)
+        self.assertIn("pruned", report)
+        self.assertIsInstance(report["pruned"], int)
+
+    def test_a_journal_that_cannot_be_read_stops_the_install_before_it_writes(self):
+        """A journal we cannot read is one we cannot extend.
+
+        Discovering that after placing the artifacts would leave them on disk
+        with nothing recording them, and `doctor` would fail against the same
+        unreadable journal — so there would be no way left to find out they are
+        there. Reading is part of the preflight, not an afterthought.
+        """
+        self.present()
+        self.store().path.parent.mkdir(parents=True, exist_ok=True)
+        self.store().path.write_bytes(b"{ not json at all")
+        code, report = self.run_cli("install", "--cli", CLI)
+        self.assertNotEqual(code, 0)
+        self.assertEqual(report["status"], "failed")
+        self.assert_no_artifacts_written()
+
+    def test_a_bad_mcp_value_is_reported_before_an_unwritable_journal(self):
+        """Both failures are present at once, and only one message can reach
+        the user. `--mcp` is resolved before `store.ensure_writable()`, and
+        that ordering is a decision, not an accident: a typo the user just
+        typed is more actionable than a filesystem permission fact they did
+        not, so it is what they see first. This pins that order so a future
+        reshuffle of the preflight has to break this test on purpose.
+        """
+        self.present()
+        self.addCleanup(self.make_journal_unwritable())
+        code, report = self.run_cli("install", "--cli", CLI, "--mcp", "bogus")
+        self.assertNotEqual(code, 0)
+        self.assertIn("bogus", report["error"])
+
+    def test_a_dry_run_also_refuses_an_unreadable_journal(self):
+        self.present()
+        self.store().path.parent.mkdir(parents=True, exist_ok=True)
+        self.store().path.write_bytes(b"{ not json at all")
+        code, _ = self.run_cli("install", "--cli", CLI, "--dry-run")
+        self.assertNotEqual(code, 0)
+
+    def test_a_report_says_how_much_this_run_placed(self):
+        """`rolled_back: false` alone reads as "the rollback failed" to something
+        that only checks the flag. The count says which it was."""
+        self.present()
+        code, report = self.run_cli("install", "--cli", CLI)
+        self.assertEqual(code, 0)
+        self.assertEqual(report["placed"], len(report["created"]))
+
+    def test_a_failed_reinstall_reports_that_it_placed_nothing(self):
+        self.present()
+        self.run_cli("install", "--cli", CLI)
+        self.addCleanup(self.make_journal_unwritable())
+        _, report = self.run_cli("install", "--cli", CLI)
+        self.assertEqual(report["placed"], 0)
+        self.assertFalse(report["rolled_back"])
+
+    def test_a_failed_reinstall_does_not_take_the_working_install_with_it(self):
+        """The rollback undoes this run, never what earlier runs already owned.
+
+        A second install creates nothing, so there is nothing to undo. Rolling
+        back the accumulated view instead would delete a working installation
+        while the journal — never written, because saving is what failed — goes
+        on claiming all of it is there. That is worse than the orphaned files
+        this command was fixed to prevent: the same lie, pointing the other way.
+        """
+        self.present()
+        self.run_cli("install", "--cli", CLI)
+        placed = self.snapshot()
+        owned = {entry.id for entry in self.installed_entries()}
+
+        self.addCleanup(self.make_journal_unwritable())
+        code, report = self.run_cli("install", "--cli", CLI)
+
+        self.assertNotEqual(code, 0)
+        # Outside the snapshots, nothing moved: the first install's files are
+        # exactly what is still there. A snapshot generation is allowed to have
+        # appeared, because taking one is this run's own behaviour rather than a
+        # mutation of the earlier install, and excluding only that leaves the
+        # original claim — that a failed reinstall adds nothing else — intact.
+        root = snapshots_root(self.filesystem, self.home)
+
+        def outside_the_snapshots(files):
+            return {path: content for path, content in files.items() if not path.is_relative_to(root)}
+
+        self.assertEqual(outside_the_snapshots(self.snapshot()), outside_the_snapshots(placed))
+        self.assertEqual({entry.id for entry in self.installed_entries()}, owned)
+        self.assertFalse(report["rolled_back"], "nothing was placed, so nothing was rolled back")
+
+    def test_a_failed_reinstall_leaves_the_installation_usable(self):
+        self.present()
+        self.run_cli("install", "--cli", CLI)
+        restore_writable = self.make_journal_unwritable()
+        self.addCleanup(restore_writable)
+        self.run_cli("install", "--cli", CLI)
+
+        restore_writable()
+        _, report = self.run_cli("doctor")
+        self.assertEqual(cli_entry(report)["missing"], [])
+        self.assertEqual(cli_entry(report)["drifted"], [])
+
+    def test_the_rollback_admits_the_settings_file_it_could_not_take_back(self):
+        """The documented residue, said out loud instead of reported as a clean undo."""
+        self.present()
+        self.addCleanup(self.make_journal_unwritable())
+        _, report = self.run_cli("install", "--cli", CLI)
+        self.assertEqual(report["left_behind"], [str(self.layout().settings_file)])
+
+    # The probe inside `existing = {... exists(path) ...}` has no test of its
+    # own, deliberately. Nothing changes on disk between it and the probe
+    # `plan` already made of the same documents, so no real condition can make
+    # one fail and the other succeed — and both refuse before a single
+    # artifact is placed, which is the same guarantee. `test_planner`'s
+    # `fail_exists` cases cover the plan-time refusal; a second test here
+    # would only be able to prove it by counting calls.
+
+
+class UnverifiedDependencyReportTest(RealHomeTestCase):
+    """Una verificación que no se encendió tiene que decirse, no deducirse.
+
+    `materialize_npm` deja los dos campos del programa en `None` cuando no
+    puede releer el script de entrada — el `entry` del descriptor quedó viejo,
+    por ejemplo. La instalación sigue, y con razón: eso es una escritura de
+    `npm ci` que faltó, no una de HPL que falló. Lo que no puede seguir es
+    en silencio, porque desde ahí `doctor` trata ese árbol igual que uno
+    anterior a la verificación: sin drift para siempre, aunque lo cambien
+    entero.
+    """
+
+    def test_a_tree_whose_program_was_never_recorded_is_named(self):
+        self.present()
+        self.run_cli("install", "--cli", CLI)
+        store = self.store()
+        journal = store.load()
+        install = journal_module.install_for(journal, CLI)
+        claimed = journal_module.Record(
+            id="dependency:probe", kind="dependency-tree",
+            target=self.home / "share" / "deps" / "probe" / "1.0.0",
+            after_digest="sha256:" + "a" * 64, created_at=AT,
+        )
+        store.save(journal_module.with_install(
+            journal, replace(install, entries=(*install.entries, claimed))
+        ))
+        _, report = self.run_cli("doctor")
+        entry = next(item for item in report["clis"] if item["cli"] == CLI)
+        self.assertIn("dependency:probe", entry["unverified"])
+
+    def test_an_install_with_nothing_unverifiable_names_nobody(self):
+        self.present()
+        self.run_cli("install", "--cli", CLI)
+        _, report = self.run_cli("doctor")
+        entry = next(item for item in report["clis"] if item["cli"] == CLI)
+        self.assertEqual(entry["unverified"], [])
+
+
+class OverwrittenReportTest(RealHomeTestCase):
+    """Ganar en silencio no es ganar: es no haber decidido la otra mitad.
+
+    Lo que el journal reclama se pisa sin preguntar, y eso no cambia. Lo que
+    cambia es que la persona se entera en el momento en que su edición se
+    gasta, y no antes por `doctor` ni después por sorpresa.
+    """
+
+    def hand_edit_one_file(self) -> tuple[str, Path]:
+        install = journal_module.install_for(self.store().load(), CLI)
+        target = next(entry for entry in install.entries if entry.kind == "file")
+        target.target.write_text("lo que escribió la persona\n", encoding="utf-8")
+        return target.id, target.target
+
+    def test_an_update_over_a_hand_edit_is_named_in_the_report(self):
+        self.present()
+        self.run_cli("install", "--cli", CLI)
+        edited, path = self.hand_edit_one_file()
+        _, report = self.run_cli("install", "--cli", CLI)
+        self.assertIn(edited, [item["id"] for item in report["overwritten"]])
+        self.assertNotEqual(path.read_text(encoding="utf-8"), "lo que escribió la persona\n")
+
+    def test_an_ordinary_install_names_nobody(self):
+        self.present()
+        self.run_cli("install", "--cli", CLI)
+        _, report = self.run_cli("install", "--cli", CLI)
+        self.assertEqual(report["overwritten"], [])
+
+    def test_the_prose_report_says_it_too(self):
+        self.present()
+        self.run_cli("install", "--cli", CLI)
+        self.hand_edit_one_file()
+        _, printed = self.run_prose("install", "--cli", CLI)
+        self.assertIn("Overwritten", printed)
+
+    def test_the_overwritten_report_names_restore_as_the_way_back(self):
+        """The snapshot `restore` reads back is the only thing that protects
+        a hand edit `install`/`update` just overwrote -- and that protection
+        is worthless if nobody reading the report knows it exists."""
+        self.present()
+        self.run_cli("install", "--cli", CLI)
+        self.hand_edit_one_file()
+        _, printed = self.run_prose("install", "--cli", CLI)
+        self.assertIn("restore", printed)
+        self.assertIn("--dry-run", printed)
+        self.assertIn(str(cli.RETAIN_GENERATIONS), printed)
+
+    def test_restore_actually_recovers_what_the_overwritten_report_names(self):
+        """The text is only honest if `restore` really does what it claims."""
+        self.present()
+        self.run_cli("install", "--cli", CLI)
+        _edited, target = self.hand_edit_one_file()
+        hand_written = target.read_bytes()
+        self.run_cli("install", "--cli", CLI)
+        self.assertNotEqual(target.read_bytes(), hand_written)
+
+        code, _report = self.run_cli("restore", "2")
+
+        self.assertEqual(code, 0)
+        self.assertEqual(target.read_bytes(), hand_written)
+
+
+class DriftReconciliationTest(RealHomeTestCase):
+    """A run that writes nothing still has to leave the journal telling the truth.
+
+    "Already current" is decided against the disk; drift is reported against
+    the journal. A hand edit that lands on exactly what a later release renders
+    makes the two disagree, and the disagreement is self-sustaining: nothing is
+    written, so the journal is never updated, so every later run repeats the
+    conclusion. Reproduced here by staling the recorded digest directly, which
+    is the same state that sequence leaves behind.
+    """
+
+    def stale_one_record(self) -> str:
+        """Rewrite one entry's digest, leaving the artifact on disk correct."""
+        store = self.store()
+        journal = store.load()
+        install = journal_module.install_for(journal, CLI)
+        target = next(entry for entry in install.entries if entry.kind == "file")
+        staled = replace(target, after_digest="sha256:" + "0" * 64)
+        entries = tuple(staled if entry.id == target.id else entry for entry in install.entries)
+        store.save(journal_module.with_install(journal, replace(install, entries=entries)))
+        return target.id
+
+    def test_a_run_that_changes_nothing_still_clears_the_drift_it_inherited(self):
+        self.present()
+        self.run_cli("install", "--cli", CLI)
+        staled = self.stale_one_record()
+        _, report = self.run_cli("doctor")
+        self.assertIn(staled, json.dumps(report["clis"]), "fixture drifted: doctor should see the drift")
+
+        _, second = self.run_cli("install", "--cli", CLI)
+        self.assertEqual(second["updated"], [], "nothing was written, so nothing may be reported as written")
+
+        _, after = self.run_cli("doctor")
+        self.assertNotIn(staled, json.dumps(after["clis"]))
+
+    def test_the_reconciled_record_is_never_offered_to_a_rollback(self):
+        """The dangerous half. A rollback removes what the journal says this
+        run placed, and a reconciliation was never placed: offering it would
+        delete a correct artifact this run did not touch.
+        """
+        self.present()
+        self.run_cli("install", "--cli", CLI)
+        staled = self.stale_one_record()
+        plan_artifacts = None
+        real_apply = planner.apply
+
+        def capture(filesystem, plan, *, at, on_step=None):
+            nonlocal plan_artifacts
+            applied = real_apply(filesystem, plan, at=at, on_step=on_step)
+            plan_artifacts = applied
+            return applied
+
+        with mock.patch.object(planner, "apply", capture):
+            self.run_cli("install", "--cli", CLI)
+        self.assertTrue(plan_artifacts.reconciled, "fixture drifted: nothing was reconciled")
+        placed = {record.id for record in plan_artifacts.records}
+        self.assertNotIn(staled, placed)
+
+
+class WriteRefusalTest(FakeHomeTestCase):
+    """The refusals `RealHomeTestCase` cannot produce: see `FakeHomeTestCase`'s
+    docstring for why they stay on the double.
+
+    Running as root and a home belonging to somebody else used to be two
+    separate cases here. They are one answer now — the filesystem says this
+    process may not write on the owner's behalf — so what is left to prove is
+    that each command honours it before touching anything, not which of the
+    two produced it.
+    """
+
+    def test_a_home_this_process_may_not_write_is_refused_before_a_single_artifact_is_written(self):
+        self.present()
+        self.filesystem.writable = False
+        code, report = self.run_cli("install", "--cli", CLI)
+        self.assertNotEqual(code, 0)
+        self.assertEqual(report["status"], "failed")
+        self.assertEqual(self.filesystem.writes, [])
+
+    def test_a_home_this_process_may_not_write_is_refused_before_anything_is_taken_back(self):
+        self.present()
+        self.run_cli("install", "--cli", CLI)
+        self.filesystem.writable = False
+        before = dict(self.filesystem.files)
+        code, _ = self.run_cli("uninstall", "--cli", CLI)
+        self.assertNotEqual(code, 0)
+        self.assertEqual(self.filesystem.files, before)
+
+
+class InstallModelAssignmentTest(RealHomeTestCase):
+    """A stored preference reaching the rendered agent, and its soft-failure posture.
+
+    `sdd-apply` is `CONFIGURABLE_AGENT` in `test_cli_models.py`, but this module
+    never imports that one to stay independent of it -- the name is repeated
+    here on purpose.
+    """
+
+    AGENT = "sdd-apply"
+
+    def write_models_catalog(self, providers: dict) -> None:
+        path = self.home / ".cache" / "opencode" / "models.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(providers), encoding="utf-8")
+
+    def rendered_agent_value(self) -> dict:
+        document = json.loads((self.layout().settings_file).read_text(encoding="utf-8"))
+        return document["agent"][self.AGENT]
+
+    def installed(self) -> None:
+        """`models set` renders what it records, so it refuses a CLI with
+        nothing installed -- every case below that stores a preference has to
+        stand on an installation first. What each one still measures is the
+        half `models set` does not do on its own: what a LATER `install` makes
+        of a preference already sitting in the store."""
+        self.present()
+        code, _ = self.run_cli("install", "--cli", CLI)
+        self.assertEqual(code, 0)
+
+    def test_an_honoured_assignment_is_written_into_the_rendered_agent(self):
+        self.installed()
+        self.write_models_catalog(
+            {"anthropic": {"builtin": True, "models": {"claude-sonnet-5": {"tool_call": True}}}}
+        )
+        self.run_cli(
+            "models", "set", "--cli", CLI, "--assign", f"{self.AGENT}=anthropic/claude-sonnet-5",
+        )
+        code, report = self.run_cli("install", "--cli", CLI)
+        self.assertEqual(code, 0)
+        self.assertEqual(report["model_warnings"], [])
+        self.assertEqual(self.rendered_agent_value()["model"], "anthropic/claude-sonnet-5")
+
+    def test_no_assignment_renders_exactly_what_it_renders_today(self):
+        self.present()
+        self.run_cli("install", "--cli", CLI)
+        self.assertNotIn("model", self.rendered_agent_value())
+
+    def test_an_effort_reaches_the_rendered_agent_as_this_clis_variant(self):
+        self.installed()
+        self.write_models_catalog(
+            {"anthropic": {"builtin": True, "models": {"claude-sonnet-5": {"tool_call": True, "reasoning": True}}}}
+        )
+        self.run_cli(
+            "models", "set", "--cli", CLI, "--assign", f"{self.AGENT}=anthropic/claude-sonnet-5", "--effort", f"{self.AGENT}=high",
+        )
+        code, report = self.run_cli("install", "--cli", CLI)
+        self.assertEqual(code, 0)
+        self.assertEqual(report["model_warnings"], [])
+        value = self.rendered_agent_value()
+        self.assertEqual(value["model"], "anthropic/claude-sonnet-5")
+        self.assertEqual(value["variant"], "high")
+
+    def test_no_effort_stored_renders_no_variant_key(self):
+        self.installed()
+        self.write_models_catalog(
+            {"anthropic": {"builtin": True, "models": {"claude-sonnet-5": {"tool_call": True}}}}
+        )
+        self.run_cli(
+            "models", "set", "--cli", CLI, "--assign", f"{self.AGENT}=anthropic/claude-sonnet-5",
+        )
+        self.run_cli("install", "--cli", CLI)
+        self.assertNotIn("variant", self.rendered_agent_value())
+
+    def test_an_unreachable_provider_does_not_break_the_install(self):
+        self.installed()
+        # No models.json at all: no provider is reachable on this machine.
+        self.run_cli(
+            "models", "set", "--cli", CLI, "--assign", f"{self.AGENT}=anthropic/claude-sonnet-5",
+        )
+        code, report = self.run_cli("install", "--cli", CLI)
+        self.assertEqual(code, 0)
+        self.assertNotIn("model", self.rendered_agent_value())
+        self.assertEqual(len(report["model_warnings"]), 1)
+        self.assertIn(self.AGENT, report["model_warnings"][0])
+        self.assertIn("anthropic", report["model_warnings"][0])
+
+    def test_a_model_the_catalog_no_longer_lists_does_not_break_the_install(self):
+        self.installed()
+        self.write_models_catalog(
+            {"anthropic": {"builtin": True, "models": {"claude-sonnet-5": {"tool_call": True}}}}
+        )
+        self.run_cli(
+            "models", "set", "--cli", CLI, "--assign", f"{self.AGENT}=anthropic/retired-model",
+        )
+        code, report = self.run_cli("install", "--cli", CLI)
+        self.assertEqual(code, 0)
+        self.assertNotIn("model", self.rendered_agent_value())
+        self.assertEqual(len(report["model_warnings"]), 1)
+        self.assertIn("retired-model", report["model_warnings"][0])
+
+    def test_an_agent_this_release_no_longer_ships_does_not_break_the_install(self):
+        self.present()
+        self.write_models_catalog(
+            {"anthropic": {"builtin": True, "models": {"claude-sonnet-5": {"tool_call": True}}}}
+        )
+        store = cli.model_assignment_store(self.runtime())
+        store.save(
+            model_assignments_module.with_assignment(
+                store.load(), CLI, "no-longer-shipped", ModelAssignment("anthropic", "claude-sonnet-5")
+            )
+        )
+        code, report = self.run_cli("install", "--cli", CLI)
+        self.assertEqual(code, 0)
+        self.assertEqual(len(report["model_warnings"]), 1)
+        self.assertIn("no-longer-shipped", report["model_warnings"][0])
+
+    def test_the_catalog_digest_is_the_same_with_or_without_an_assignment(self):
+        """Release identity must not move because of a fact about one machine."""
+        self.present()
+        self.run_cli("install", "--cli", CLI)
+        without = journal_module.install_for(self.store().load(), CLI).release["catalog_digest"]
+
+        self.write_models_catalog(
+            {"anthropic": {"builtin": True, "models": {"claude-sonnet-5": {"tool_call": True}}}}
+        )
+        self.run_cli(
+            "models", "set", "--cli", CLI, "--assign", f"{self.AGENT}=anthropic/claude-sonnet-5",
+        )
+        self.run_cli("install", "--cli", CLI)
+        with_assignment = journal_module.install_for(self.store().load(), CLI).release["catalog_digest"]
+        self.assertEqual(without, with_assignment)
+
+
+class InstallMcpTest(RealHomeTestCase):
+    """`--mcp` is the whole point of this unit: nothing installs unless named."""
+
+    def settings(self) -> dict:
+        return json.loads(self.layout().settings_file.read_bytes())
+
+    def convention_path(self, server_id: str) -> Path:
+        # Derived, not spelled out: the core owns where a convention lands, and a
+        # second copy of that layout here would drift the first time it moves.
+        return self.layout().skills_dir / content_module.mcp_convention_path(server_id)
+
+    def tools_of(self, agent_name: str) -> dict:
+        return self.settings()["agent"][agent_name]["tools"]
+
+    def test_choosing_context7_places_its_key_and_its_convention_file(self):
+        self.present()
+        code, report = self.run_cli("install", "--cli", CLI, "--mcp", "context7")
+        self.assertEqual(code, 0)
+        self.assertIn("context7", self.settings()["mcp"])
+        self.assertTrue(self.filesystem.exists(self.convention_path("context7")))
+
+    def test_choosing_context7_grants_it_to_the_agents_that_declare_it(self):
+        self.present()
+        self.run_cli("install", "--cli", CLI, "--mcp", "context7")
+        self.assertEqual(
+            self.tools_of("sdd-apply"),
+            {
+                "*": False,
+                "read": True,
+                "write": True,
+                "edit": True,
+                "bash": True,
+                "grep": True,
+                "glob": True,
+                "context7*": True,
+            },
+        )
+
+    def test_choosing_nothing_places_no_server_and_no_grant(self):
+        self.present()
+        code, report = self.run_cli("install", "--cli", CLI)
+        self.assertEqual(code, 0)
+        self.assertNotIn("mcp", self.settings())
+        self.assertFalse(self.filesystem.exists(self.convention_path("context7")))
+        self.assertEqual(
+            self.tools_of("sdd-apply"),
+            {
+                "*": False,
+                "read": True,
+                "write": True,
+                "edit": True,
+                "bash": True,
+                "grep": True,
+                "glob": True,
+            },
+        )
+
+    def test_choosing_nothing_ships_no_engram_memory_protocol_anywhere(self):
+        """The memory protocol now lives entirely in engram's own convention
+        body: naming no server must leave no trace of it, neither as a
+        convention file nor inlined into the shipped system prompt."""
+        self.present()
+        code, report = self.run_cli("install", "--cli", CLI)
+        self.assertEqual(code, 0)
+        self.assertNotIn("mcp", self.settings())
+        self.assertFalse(self.filesystem.exists(self.convention_path("engram")))
+        prompt_text = self.layout().system_prompt_file.read_text(encoding="utf-8")
+        self.assertNotIn("Engram Persistent Memory", prompt_text)
+        self.assertNotIn("PROACTIVE SAVE TRIGGERS", prompt_text)
+        self.assertNotIn("Session Close Protocol", prompt_text)
+        self.assertNotIn("mem_search", prompt_text)
+        self.assertNotIn("mem_context", prompt_text)
+        # The delivery guarantee is not engram-specific, so it ships either way,
+        # `mem_save` and friends included as its own worked example.
+        self.assertIn("DELIVERY GUARANTEE", prompt_text)
+
+    def test_binding_a_server_writes_no_key_and_fetches_nothing(self):
+        """The whole point, end to end: an installation that already runs the
+        server gets the contract without a second definition beside its own,
+        and without a download this machine never asked for. `--dry-run`
+        answers both at once -- the plan names every artifact, and a fetch
+        that were going to happen would show as a dependency to materialize.
+        """
+        self.present()
+        code, report = self.run_cli(
+            "install", "--cli", CLI, "--mcp", "cbm=codebase-memory-mcp", "--dry-run"
+        )
+        self.assertEqual(code, 0)
+        planned = {item["id"] for group in ("created", "updated") for item in report[group]}
+        self.assertIn("mcp-convention:cbm", planned)
+        self.assertNotIn("mcp:cbm", planned)
+        self.assertNotIn("dependency:cbm", planned)
+
+    def test_a_bound_server_grants_its_tools_under_the_key_the_runtime_resolves(self):
+        """A grant spelled `cbm*` would match nothing in an installation whose
+        server is called something else -- the tools would be silently absent,
+        which is the failure this feature exists to prevent."""
+        self.present()
+        code, _ = self.run_cli("install", "--cli", CLI, "--mcp", "cbm=codebase-memory-mcp")
+        self.assertEqual(code, 0)
+        tools = self.tools_of("sdd-apply")
+        self.assertIs(tools.get("codebase-memory-mcp*"), True)
+        self.assertNotIn("cbm*", tools)
+
+    def test_a_bound_server_leaves_the_settings_mcp_map_untouched(self):
+        self.present()
+        code, _ = self.run_cli("install", "--cli", CLI, "--mcp", "cbm=codebase-memory-mcp")
+        self.assertEqual(code, 0)
+        self.assertNotIn("cbm", self.settings().get("mcp", {}))
+
+    def test_a_binding_is_recorded_on_the_journal(self):
+        """The key was computed by `select_mcp` and then never written down
+        anywhere durable; recording it on `Install` is what lets a later
+        `doctor` name it instead of losing it the moment this process exits."""
+        self.present()
+        code, _ = self.run_cli("install", "--cli", CLI, "--mcp", "cbm=codebase-memory-mcp")
+        self.assertEqual(code, 0)
+        install = journal_module.install_for(self.store().load(), CLI)
+        self.assertEqual(install.mcp_bindings, {"cbm": "codebase-memory-mcp"})
+
+    def test_reinstalling_with_a_different_key_replaces_the_recorded_binding(self):
+        self.present()
+        self.run_cli("install", "--cli", CLI, "--mcp", "cbm=codebase-memory-mcp")
+        code, _ = self.run_cli("install", "--cli", CLI, "--mcp", "cbm=other-server-key")
+        self.assertEqual(code, 0)
+        install = journal_module.install_for(self.store().load(), CLI)
+        self.assertEqual(install.mcp_bindings, {"cbm": "other-server-key"})
+
+    def test_reinstalling_with_an_explicit_empty_selection_drops_its_recorded_binding(self):
+        """A binding dropped from the selection must not linger on the journal
+        once the reinstall that dropped it is recorded. This must be asked for
+        through `--mcp none`, the explicit empty selection: a bare reinstall
+        (`--mcp` never given) now refuses instead of guessing, per the guard
+        in `cli.install`."""
+        self.present()
+        self.run_cli("install", "--cli", CLI, "--mcp", "cbm=codebase-memory-mcp")
+        code, _ = self.run_cli("install", "--cli", CLI, "--mcp", "none")
+        self.assertEqual(code, 0)
+        install = journal_module.install_for(self.store().load(), CLI)
+        self.assertEqual(install.mcp_bindings, {})
+
+    def test_a_malformed_binding_is_refused_with_the_value_quoted(self):
+        self.present()
+        code, report = self.run_cli("install", "--cli", CLI, "--mcp", "cbm=")
+        self.assertEqual(code, 1)
+        self.assertIn("cbm=", json.dumps(report))
+
+    def test_choosing_engram_plans_its_key_and_its_convention_file(self):
+        """`download` servers materialize real dependencies on a real install,
+        which this test suite must never trigger over the network. `--dry-run`
+        computes the same plan without fetching anything, which is exactly
+        what proves the convention travels with the server once it is named."""
+        self.present()
+        code, report = self.run_cli("install", "--cli", CLI, "--mcp", "engram", "--dry-run")
+        self.assertEqual(code, 0)
+        created_ids = {item["id"] for item in report["created"]}
+        self.assertIn("mcp:engram", created_ids)
+        self.assertIn("mcp-convention:engram", created_ids)
+
+    def test_choosing_engram_ships_the_delivery_guarantee_too(self):
+        """Selecting a server changes what conventions ship; it must never
+        change whether the universal system prompt ships."""
+        self.present()
+        code, report = self.run_cli("install", "--cli", CLI, "--mcp", "engram", "--dry-run")
+        self.assertEqual(code, 0)
+        created_ids = {item["id"] for item in report["created"]}
+        self.assertIn("system-prompt:hpl-AGENTS.md", created_ids)
+
+    def test_an_unknown_server_id_fails_cleanly_and_places_nothing(self):
+        self.present()
+        code, report = self.run_cli("install", "--cli", CLI, "--mcp", "bogus")
+        self.assertEqual(code, cli.FAILED)
+        self.assertEqual(report["status"], "failed")
+        self.assertIn("bogus", report["error"])
+        self.assert_disk_untouched()
+
+    def test_the_flag_is_repeatable(self):
+        """No second shipped server exists yet, so this proves append semantics
+        the only way available: naming the same id twice still selects it once,
+        rather than the second `--mcp` silently replacing the first."""
+        self.present()
+        code, report = self.run_cli("install", "--cli", CLI, "--mcp", "context7", "--mcp", "context7")
+        self.assertEqual(code, 0)
+        self.assertIn("context7", self.settings()["mcp"])
+
+    def test_reinstalling_with_none_takes_its_key_and_file_back_out(self):
+        """A server chosen once and then explicitly revoked with `--mcp none`
+        should not stay behind as an orphan: this is the case the unit exists
+        to prove one way or the other. A *bare* reinstall no longer reaches
+        this at all -- it refuses instead, per `InstallMcpGuardTest` -- so
+        retirement now has to be asked for on purpose."""
+        self.present()
+        self.run_cli("install", "--cli", CLI, "--mcp", "context7")
+        self.assertIn("context7", self.settings()["mcp"])
+        self.assertTrue(self.filesystem.exists(self.convention_path("context7")))
+
+        code, report = self.run_cli("install", "--cli", CLI, "--mcp", "none")
+        self.assertEqual(code, 0)
+        self.assertNotIn("context7", self.settings().get("mcp", {}))
+        self.assertFalse(self.filesystem.exists(self.convention_path("context7")))
+
+    def test_a_dry_run_of_reinstalling_without_the_server_reports_what_it_would_retire(self):
+        """A `--dry-run` that omits `--mcp` is about to retire two entries, and
+        saying `updated 5, unchanged 101` without naming them would be lying by
+        omission about what this run is going to do."""
+        self.present()
+        self.run_cli("install", "--cli", CLI, "--mcp", "context7")
+        before = self.snapshot()
+
+        code, report = self.run_cli("install", "--cli", CLI, "--dry-run")
+
+        self.assertEqual(code, 0)
+        self.assertEqual({item["id"] for item in report["retired"]}, {"mcp:context7", "mcp-convention:context7"})
+        self.assertEqual(self.snapshot(), before)
+
+    def test_reinstalling_with_none_reports_what_it_retired(self):
+        self.present()
+        self.run_cli("install", "--cli", CLI, "--mcp", "context7")
+
+        code, report = self.run_cli("install", "--cli", CLI, "--mcp", "none")
+
+        self.assertEqual(code, 0)
+        self.assertEqual({item["id"] for item in report["retired"]}, {"mcp:context7", "mcp-convention:context7"})
+
+    def test_the_snapshot_of_a_retiring_reinstall_covers_what_it_is_about_to_retire(self):
+        """`context7-convention.md` shares no address with anything else this run
+        touches, so nothing else would ever put it in the snapshot. Without this,
+        a `restore` after this reinstall gives back the key but not the file."""
+        self.present()
+        self.run_cli("install", "--cli", CLI, "--mcp", "context7")
+        convention = self.convention_path("context7")
+
+        self.run_cli("install", "--cli", CLI, "--mcp", "none")
+
+        self.assertFalse(self.filesystem.exists(convention))
+
+        code, report = self.run_cli("restore", "2")
+
+        self.assertEqual(code, 0)
+        self.assertIn("context7", self.settings()["mcp"])
+        self.assertTrue(self.filesystem.exists(convention))
+
+    def test_a_reinstall_that_cannot_be_recorded_reports_what_it_already_retired(self):
+        """Retiring runs before the journal is saved, so a journal failure here
+        leaves at least the convention file gone, unrecorded and un-rolled-back
+        — `unplace` has no way to recreate a file it never wrote. The settings
+        document happens to come back whole, because it was also touched by an
+        update this run made and rolled back; the file has no such luck, which
+        is exactly the asymmetry the report has to admit."""
+        self.present()
+        self.run_cli("install", "--cli", CLI, "--mcp", "context7")
+        convention = self.convention_path("context7")
+        self.addCleanup(self.make_journal_unwritable())
+
+        code, report = self.run_cli("install", "--cli", CLI, "--mcp", "none")
+
+        self.assertNotEqual(code, 0)
+        self.assertEqual(report["status"], "failed")
+        self.assertIn("mcp:context7", report["retired"])
+        self.assertIn("mcp-convention:context7", report["retired"])
+        self.assertFalse(self.filesystem.exists(convention))
+
+    def test_a_reinstall_whose_retirement_fails_reports_honestly_and_rolls_back_this_runs_placements(self):
+        """`retire` runs before `store.save`, in its own `try` now: a failure
+        here used to propagate straight to `main`'s generic handler, which has
+        no report payload for it, so `_prose` printed "Nothing was changed"
+        while this run's own placement — the settings document, updated to
+        drop the context7 tool grant — sat on disk, unrecorded. That is the
+        same class of problem `_unrecordable` exists to prevent for a
+        journal-save failure, and it gets the same treatment: this run's own
+        placement comes back out, and the report says so rather than lying
+        about a clean nothing-happened."""
+        self.present()
+        self.run_cli("install", "--cli", CLI, "--mcp", "context7")
+        convention = self.convention_path("context7")
+        self.addCleanup(make_undeletable(convention))
+
+        code, report = self.run_cli("install", "--cli", CLI, "--mcp", "none")
+
+        self.assertNotEqual(code, 0)
+        self.assertEqual(report["status"], "failed")
+        self.assertTrue(report["rolled_back"])
+        self.assertIn("retiring", report["error"])
+        self.assertNotIn("journal could not be written", report["error"])
+        self.assertNotIn("Nothing was changed", cli._prose(report))
+        # The removal that failed never happened, and this run's own update to
+        # the settings document was taken back out along with it.
+        self.assertTrue(self.filesystem.exists(convention))
+
+    # The companion of the journal-write case — a probe that fails inside the
+    # handler already reporting a retirement failure — lives in
+    # `SecondaryFaultTest`, against a real home. Both conditions it needs are
+    # permissions, and the double has none.
+
+
+class InstallNodePreflightTest(RealHomeTestCase):
+    """Choosing an `npm` server without Node on `PATH` used to run the whole
+    install and fail at the very last step, inside `materialize_npm`. This is
+    the preflight guard that catches the same fact before the first artifact
+    is written — including on a `--dry-run`, so the TUI's plan-preview screen
+    can surface it at selection time rather than at the point of no return.
+    """
+
+    def with_node_on_path(self) -> dict[str, str]:
+        """A throwaway `PATH` entry holding an executable file named `node`,
+        so `shutil.which` finds it exactly the way it would find a real
+        Node installation."""
+        bin_dir = self.home / "fake-bin"
+        bin_dir.mkdir(parents=True, exist_ok=True)
+        node = bin_dir / "node"
+        node.write_text("#!/bin/sh\nexit 0\n")
+        node.chmod(0o755)
+        return {"PATH": str(bin_dir)}
+
+    def test_choosing_an_npm_server_without_node_is_refused_before_anything_is_written(self):
+        self.present()
+        code, report = self.run_cli("install", "--cli", CLI, "--mcp", "playwright")
+        self.assertNotEqual(code, 0)
+        self.assertEqual(report["status"], "failed")
+        self.assertIn("playwright", report["error"])
+        self.assertIn("node", report["error"])
+        self.assert_disk_untouched()
+
+    def test_the_refusal_fires_on_a_dry_run_too(self):
+        """A dry run is what the TUI's plan-preview screen runs, so this is
+        what makes the user learn about the missing runtime at selection time
+        instead of at the point of no return."""
+        self.present()
+        code, report = self.run_cli("install", "--cli", CLI, "--mcp", "playwright", "--dry-run")
+        self.assertNotEqual(code, 0)
+        self.assertEqual(report["status"], "failed")
+        self.assertIn("playwright", report["error"])
+        self.assert_disk_untouched()
+
+    def test_choosing_no_npm_server_does_not_require_node(self):
+        """`context7` is a `remote` server: nothing about its selection should
+        ever need Node on `PATH`."""
+        self.present()
+        code, report = self.run_cli("install", "--cli", CLI, "--mcp", "context7")
+        self.assertEqual(code, 0)
+
+    def test_node_present_lets_the_npm_server_selection_through(self):
+        """With Node on `PATH`, the preflight guard has nothing to say, and
+        the run proceeds to its normal dry-run report."""
+        self.present()
+        context = cli.Runtime(
+            filesystem=self.filesystem, home=self.home, now=AT, out=io.StringIO(),
+            variables=self.with_node_on_path(),
+        )
+        code = cli.main(["install", "--cli", CLI, "--mcp", "playwright", "--dry-run", "--json"], runtime=context)
+        report = json.loads(context.out.getvalue())
+        self.assertEqual(code, 0)
+        self.assertEqual(report["status"], "planned")
+
+
+class InstallUnaccountedRetirementTest(RealHomeTestCase):
+    """A retiring reinstall can meet a journal entry it cannot account for: an
+    appended list item whose recorded digest matches nothing currently
+    present. The user having deleted it and the user having edited it beyond
+    recognition are physically indistinguishable, so it must not be reported,
+    or treated, as a removal — see `Retired.unaccounted`'s docstring."""
+
+    def inject_unaccounted_entry(self) -> None:
+        """A journal entry no render will ever ask for again, pointing at a
+        real appended list (`/plugin/-`, always non-empty after an install) so
+        it has survivors to be ambiguous among, with a digest that matches
+        none of them."""
+        store = self.store()
+        journal = store.load()
+        install = journal_module.install_for(journal, CLI)
+        template = next(entry for entry in install.entries if entry.id == "own:notifier-plugin")
+        fantasma = replace(template, id="own:fantasma", after_digest="sha256:" + "0" * 64)
+        store.save(journal_module.with_install(journal, replace(install, entries=install.entries + (fantasma,))))
+
+    def test_an_unaccounted_entry_is_not_reported_as_retired(self):
+        self.present()
+        self.run_cli("install", "--cli", CLI, "--mcp", "context7")
+        self.inject_unaccounted_entry()
+
+        code, report = self.run_cli("install", "--cli", CLI, "--mcp", "none")
+
+        self.assertEqual(code, 0)
+        self.assertNotIn("own:fantasma", {item["id"] for item in report["retired"]})
+        self.assertIn("own:fantasma", report["unaccounted"])
+
+    def test_an_unaccounted_entry_keeps_its_record_in_the_journal(self):
+        self.present()
+        self.run_cli("install", "--cli", CLI, "--mcp", "context7")
+        self.inject_unaccounted_entry()
+
+        self.run_cli("install", "--cli", CLI, "--mcp", "none")
+
+        self.assertIn("own:fantasma", {entry.id for entry in self.installed_entries()})
+
+    def test_the_unaccounted_entry_does_not_stop_genuinely_removed_entries_from_being_retired(self):
+        """`mcp:context7` and `mcp-convention:context7` are addressable, not
+        appended, so they are unconditionally removed in the same run that
+        leaves `own:fantasma` unaccounted for right next to them."""
+        self.present()
+        self.run_cli("install", "--cli", CLI, "--mcp", "context7")
+        self.inject_unaccounted_entry()
+
+        code, report = self.run_cli("install", "--cli", CLI, "--mcp", "none")
+
+        self.assertEqual(code, 0)
+        self.assertEqual({item["id"] for item in report["retired"]}, {"mcp:context7", "mcp-convention:context7"})
+        owned = {entry.id for entry in self.installed_entries()}
+        self.assertNotIn("mcp:context7", owned)
+        self.assertNotIn("mcp-convention:context7", owned)
+        self.assertIn("own:fantasma", owned)
+
+    def test_the_prose_says_what_could_not_be_accounted_for_too(self):
+        """`_prose` promises the same facts as the document, never a subset of
+        them, and `uninstall`'s branch already keeps that promise. A person who
+        does not pass `--json` has no other way to learn that an entry was left
+        behind rather than retired."""
+        self.present()
+        self.run_cli("install", "--cli", CLI, "--mcp", "context7")
+        self.inject_unaccounted_entry()
+
+        code, out = self.run_prose("install", "--cli", CLI, "--mcp", "none")
+
+        self.assertEqual(code, 0)
+        self.assertIn("own:fantasma", out)
+
+
+class SecondaryFaultTest(RealHomeTestCase):
+    """A probe that fails inside a handler already reporting another failure.
+
+    Both of these place their artifacts, hit a real failure, and then — while
+    building the report for it — cannot determine the state of a document they
+    have to mention. The specific report has to survive that second fault;
+    letting it escape would replace the one message a user reads when
+    something already went wrong with `main`'s generic one, and lose the
+    rollback accounting with it.
+
+    Neither condition is injected. The directory that refuses the write really
+    refuses it, and the file that cannot be probed really cannot be, because
+    `apply` created it after the run had already decided it was absent.
+    """
+
+    def convention(self) -> Path:
+        return self.layout().skills_dir / content_module.mcp_convention_path("context7")
+
+    def test_a_journal_write_failure_still_reports_specifically(self):
+        self.present()
+        settings = self.layout().settings_file
+        self.refuse_to_write_the_journal()
+        self.refuse_to_probe_once_it_exists(settings)
+
+        code, report = self.run_cli("install", "--cli", CLI)
+
+        self.assertNotEqual(code, 0)
+        self.assertEqual(report["status"], "failed")
+        self.assertIn("journal could not be written", report["error"])
+        self.assertIn("rolled_back", report)
+
+    def test_a_retirement_failure_still_reports_specifically(self):
+        """The other `try` that computes `left_behind`, around `retire`.
+
+        The settings document is removed between the two runs so this run
+        creates it again — which is what makes it absent when the run first
+        probes it and present when the handler probes it a second time.
+        """
+        self.present()
+        self.run_cli("install", "--cli", CLI, "--mcp", "context7")
+        settings = self.layout().settings_file
+        settings.unlink()
+        # The convention file cannot be removed, which is what makes retiring fail.
+        self.addCleanup(make_undeletable(self.convention()))
+        self.refuse_to_probe_once_it_exists(settings)
+
+        code, report = self.run_cli("install", "--cli", CLI, "--mcp", "none")
+
+        self.assertNotEqual(code, 0)
+        self.assertEqual(report["status"], "failed")
+        self.assertIn("retiring", report["error"])
+        self.assertNotIn("journal could not be written", report["error"])
+        self.assertTrue(self.convention().exists())
+
+
+class UninstallTest(RealHomeTestCase):
+    def install(self):
+        self.present()
+        self.run_cli("install", "--cli", CLI)
+
+    def test_uninstalling_reports_what_it_took_back(self):
+        self.install()
+        code, report = self.run_cli("uninstall", "--cli", CLI)
+        self.assertEqual(code, 0)
+        self.assertEqual(report["status"], "uninstalled")
+        self.assertTrue(report["removed"])
+        self.assertEqual(report["unaccounted"], [])
+
+    def test_uninstalling_forgets_the_install_in_the_journal(self):
+        self.install()
+        self.run_cli("uninstall", "--cli", CLI)
+        self.assertIsNone(journal_module.install_for(self.store().load(), CLI))
+
+    def test_uninstalling_what_was_never_installed_says_so(self):
+        self.present()
+        code, report = self.run_cli("uninstall", "--cli", CLI)
+        self.assertNotEqual(code, 0)
+        self.assertEqual(report["status"], "failed")
+
+    def test_an_artifact_the_user_edited_is_removed_too(self):
+        self.install()
+        edited = next(e for e in self.installed_entries() if e.kind == "file")
+        edited.target.write_bytes(b"the user rewrote this")
+        _, report = self.run_cli("uninstall", "--cli", CLI)
+        self.assertIn(edited.id, report["removed"])
+        self.assertFalse(edited.target.exists())
+
+    def test_uninstalling_reports_the_directories_it_pruned(self):
+        self.install()
+        _, report = self.run_cli("uninstall", "--cli", CLI)
+        self.assertIn("pruned", report)
+        self.assertIsInstance(report["pruned"], list)
+
+    def test_a_preexisting_empty_directory_survives_uninstall_and_is_not_reported_pruned(self):
+        """The repro this whole change exists for: someone who already had
+        `~/.config/opencode/plugins/` before ever installing HPL loses it
+        on `uninstall` if HPL later wrote a file inside it and the prune
+        pass cannot tell "I made this directory" from "this was here all
+        along" -- both look identical once the file inside is gone and the
+        directory is empty.
+
+        A fabricated journal entry stands in for that file here, planted
+        directly rather than through the real catalog, because what matters
+        is the fact this journal entry's directory was never reported by
+        `make_dir` -- `created_dirs` never names it -- and that fact does not
+        depend on which real artifact the catalog happens to place where.
+        """
+        self.install()
+        config_dir = self.layout().config_dir
+        preexisting = config_dir / "a-directory-the-person-already-had"
+        preexisting.mkdir()
+        target = preexisting / "a-file-hpl-later-wrote.md"
+        content = b"whatever this release rendered"
+        target.write_bytes(content)
+
+        store = self.store()
+        journal = store.load()
+        install = journal_module.install_for(journal, CLI)
+        fabricated = journal_module.Record(
+            id="probe:fabricated",
+            kind="file",
+            target=target,
+            after_digest=ownership.digest_of_bytes(content),
+            created_at=AT,
+        )
+        store.save(journal_module.with_install(journal, replace(install, entries=install.entries + (fabricated,))))
+
+        _, report = self.run_cli("uninstall", "--cli", CLI)
+        self.assertTrue(preexisting.exists())
+        self.assertNotIn("a-directory-the-person-already-had", report["pruned"])
+
+    def test_uninstall_prose_names_restore_as_the_way_back(self):
+        """`uninstall` deletes without asking whose edit it is losing; the
+        only recourse is `restore`, so the report must say so, generation
+        limit included."""
+        self.install()
+        _, printed = self.run_prose("uninstall", "--cli", CLI)
+        self.assertIn("restore", printed)
+        self.assertIn(str(cli.RETAIN_GENERATIONS), printed)
+
+    def test_restore_actually_recovers_what_uninstall_names(self):
+        """The text is only honest if `restore` really does put things back
+        exactly as they were before `uninstall`."""
+        self.install()
+        before = {
+            path: path.read_bytes() for path in self.layout().config_dir.rglob("*") if path.is_file()
+        }
+        code, _report = self.run_cli("uninstall", "--cli", CLI)
+        self.assertEqual(code, 0)
+
+        # `restore` with no argument targets the most recent readable
+        # generation, which is the one `uninstall` itself just took.
+        code, _ = self.run_cli("restore")
+
+        self.assertEqual(code, 0)
+        after = {
+            path: path.read_bytes() for path in self.layout().config_dir.rglob("*") if path.is_file()
+        }
+        self.assertEqual(after, before)
+
+    def test_uninstalling_leaves_no_empty_directory_behind(self):
+        """The integration-level mirror of `PruneEmptyDirectoriesTest`'s own
+        guardian assertion in `test_planner.py`: whatever this CLI's real
+        catalog places, nothing empty is left standing under its config
+        directory once uninstall is done with it."""
+        self.install()
+        config_dir = self.layout().config_dir
+        self.run_cli("uninstall", "--cli", CLI)
+        empties = (
+            [
+                dirpath
+                for dirpath, dirnames, filenames in os.walk(config_dir)
+                if dirpath != str(config_dir) and not dirnames and not filenames
+            ]
+            if config_dir.exists()
+            else []
+        )
+        self.assertEqual(empties, [])
+
+
+class DoctorTest(RealHomeTestCase):
+    def install(self):
+        self.present()
+        self.run_cli("install", "--cli", CLI)
+
+    def entry_for(self, report, cli_id: str = CLI):
+        return cli_entry(report, cli_id)
+
+    def test_doctor_lists_every_supported_cli(self):
+        _, report = self.run_cli("doctor")
+        self.assertEqual([entry["cli"] for entry in report["clis"]], list(available().ids()))
+
+    def test_a_distributions_doctor_reports_its_own_version_not_the_engines(self):
+        """The `hpl_version` KEY is a stable wire identifier, unchanged
+        across every distribution -- but its VALUE used to be
+        `hpl.__version__` unconditionally, so a distribution's own
+        `doctor --json` reported the pinned engine's own version rather than
+        its own release."""
+        distribution_identity = identity_module.parse(
+            json.dumps(_DISTRIBUTION_IDENTITY_PAYLOAD).encode("utf-8")
+        )
+        self.assertNotEqual(distribution_identity.version, hpl.__version__)
+        _, report = self.run_cli("doctor", identity=distribution_identity)
+        self.assertEqual(report["hpl_version"], distribution_identity.version)
+
+    def test_doctor_reports_a_clean_home_as_not_installed(self):
+        self.present()
+        _, report = self.run_cli("doctor")
+        self.assertFalse(self.entry_for(report)["hpl_installed"])
+
+    def test_doctor_reports_an_absent_cli_as_undetected(self):
+        _, report = self.run_cli("doctor")
+        self.assertFalse(self.entry_for(report)["detected"])
+
+    def test_doctor_counts_what_is_installed_and_finds_no_drift(self):
+        self.install()
+        _, report = self.run_cli("doctor")
+        entry = self.entry_for(report)
+        self.assertTrue(entry["hpl_installed"])
+        self.assertGreater(entry["artifacts"], 0)
+        self.assertEqual(entry["drifted"], [])
+        self.assertEqual(entry["missing"], [])
+
+    def claim_a_dependency_tree(
+        self, target: Path, *, program_relpath: str | None = None, program_digest: str | None = None
+    ) -> None:
+        """Put a record for a materialized dependency into the journal.
+
+        Nothing materializes one yet, so the record is written by hand — but
+        the kind is real, and `doctor` reads whatever the journal claims.
+        Leaving ``program_relpath``/``program_digest`` unset is itself a real
+        case: a record written before `dependencies.materialize` recorded
+        that pair at all.
+        """
+        store = self.store()
+        journal = store.load()
+        install = journal_module.install_for(journal, CLI)
+        claimed = journal_module.Record(
+            id="dependency:probe",
+            kind="dependency-tree",
+            target=target,
+            after_digest=ownership.digest_of_bytes(b"whatever the archive hashed to"),
+            created_at=AT,
+            program_relpath=program_relpath,
+            program_digest=program_digest,
+        )
+        grown = replace(install, entries=(*install.entries, claimed))
+        store.save(journal_module.with_install(journal, grown))
+
+    def test_doctor_reports_a_dependency_tree_that_is_there_as_healthy(self):
+        """A tree that is present is healthy, not undeterminable.
+
+        The digest a tree carries names what was materialized, not what is on
+        disk now, so being there is the whole of what can be checked. Read as
+        a configuration document instead — which is what happens to any kind
+        the reader does not know — a directory refuses to be read at all, and
+        the entry lands in `unreadable`: a report that HPL could not tell,
+        about something it can tell perfectly well.
+        """
+        self.install()
+        tree = self.home / "deps" / "probe" / "1.0.0"
+        tree.mkdir(parents=True)
+        self.claim_a_dependency_tree(tree)
+
+        code, report = self.run_cli("doctor")
+
+        self.assertEqual(code, 0)
+        entry = self.entry_for(report)
+        self.assertNotIn("dependency:probe", entry["unreadable"])
+        self.assertNotIn("dependency:probe", entry["drifted"])
+        self.assertNotIn("dependency:probe", entry["missing"])
+
+    def test_doctor_reports_a_dependency_tree_that_is_gone_as_missing(self):
+        self.install()
+        self.claim_a_dependency_tree(self.home / "deps" / "probe" / "1.0.0")
+
+        _, report = self.run_cli("doctor")
+
+        self.assertIn("dependency:probe", self.entry_for(report)["missing"])
+
+    def test_doctor_reports_a_dependency_tree_whose_program_is_untouched_as_healthy(self):
+        """The program named by `program_relpath` still hashes to
+        `program_digest`, so this is the intact case, distinct from the older
+        "the tree is merely present" case above only in that it was actually
+        checked rather than left unchecked.
+        """
+        self.install()
+        tree = self.home / "deps" / "probe" / "1.0.0"
+        tree.mkdir(parents=True)
+        program = tree / "probe"
+        program.write_bytes(b"the real program bytes")
+        self.claim_a_dependency_tree(
+            tree,
+            program_relpath="probe",
+            program_digest=ownership.digest_of_bytes(b"the real program bytes"),
+        )
+
+        code, report = self.run_cli("doctor")
+
+        self.assertEqual(code, 0)
+        entry = self.entry_for(report)
+        self.assertNotIn("dependency:probe", entry["drifted"])
+        self.assertNotIn("dependency:probe", entry["missing"])
+        self.assertNotIn("dependency:probe", entry["unreadable"])
+
+    def test_doctor_reports_a_substituted_program_as_drifted(self):
+        """The tree is there, and the program `program_relpath` names is
+        there too -- but its bytes no longer hash to `program_digest`, which
+        is exactly the substitution this check exists to catch: the one file
+        whose replacement would matter, being something other than what
+        HPL placed.
+        """
+        self.install()
+        tree = self.home / "deps" / "probe" / "1.0.0"
+        tree.mkdir(parents=True)
+        program = tree / "probe"
+        program.write_bytes(b"the real program bytes")
+        self.claim_a_dependency_tree(
+            tree,
+            program_relpath="probe",
+            program_digest=ownership.digest_of_bytes(b"the real program bytes"),
+        )
+        program.write_bytes(b"a substituted binary, not what hpl placed")
+
+        _, report = self.run_cli("doctor")
+
+        self.assertIn("dependency:probe", self.entry_for(report)["drifted"])
+
+    def test_doctor_reports_an_absent_program_as_missing_even_though_the_tree_is_there(self):
+        """The tree directory itself still exists -- only the one file inside
+        it that a CLI's configuration would actually run is gone. That must
+        land in `missing`, the same bucket an entirely absent tree lands in,
+        since a configuration pointed at this program can no longer run it
+        either way.
+        """
+        self.install()
+        tree = self.home / "deps" / "probe" / "1.0.0"
+        tree.mkdir(parents=True)
+        self.claim_a_dependency_tree(
+            tree,
+            program_relpath="probe",
+            program_digest=ownership.digest_of_bytes(b"the real program bytes"),
+        )
+
+        _, report = self.run_cli("doctor")
+
+        self.assertIn("dependency:probe", self.entry_for(report)["missing"])
+
+    def test_doctor_names_an_artifact_the_user_edited(self):
+        self.install()
+        edited = next(e for e in self.installed_entries() if e.kind == "file")
+        edited.target.write_bytes(b"changed by hand")
+        _, report = self.run_cli("doctor")
+        self.assertEqual(self.entry_for(report)["drifted"], [edited.id])
+
+    def test_doctor_names_an_artifact_that_went_missing(self):
+        self.install()
+        gone = next(e for e in self.installed_entries() if e.kind == "file")
+        gone.target.unlink()
+        _, report = self.run_cli("doctor")
+        self.assertEqual(self.entry_for(report)["missing"], [gone.id])
+
+    def test_doctor_notices_a_configuration_key_the_user_removed(self):
+        self.install()
+        key = next(e for e in self.installed_entries() if e.kind == "config-key" and not e.pointer.endswith("/-"))
+        document = json.loads(key.target.read_bytes())
+        del document["agent" if "agent" in key.pointer else key.pointer.strip("/").split("/")[0]]
+        key.target.write_bytes(json.dumps(document).encode("utf-8"))
+        _, report = self.run_cli("doctor")
+        self.assertIn(key.id, self.entry_for(report)["missing"])
+
+    def test_doctor_names_an_artifact_whose_state_could_not_be_determined(self):
+        """An entry `exists` cannot probe is neither missing nor drifted —
+        claiming either would be inventing a fact doctor could not check."""
+        self.install()
+        unreadable = next(e for e in self.installed_entries() if e.kind == "file")
+        self.refuse_to_probe_once_it_exists(unreadable.target)
+        _, report = self.run_cli("doctor")
+        entry = self.entry_for(report)
+        self.assertEqual(entry["unreadable"], [unreadable.id])
+        self.assertNotIn(unreadable.id, entry["missing"])
+        self.assertNotIn(unreadable.id, entry["drifted"])
+
+    def test_doctor_does_not_abort_the_whole_report_over_one_unreadable_entry(self):
+        self.install()
+        entries = self.installed_entries()
+        unreadable = next(e for e in entries if e.kind == "file")
+        self.refuse_to_probe_once_it_exists(unreadable.target)
+        code, report = self.run_cli("doctor")
+        self.assertEqual(code, 0)
+        self.assertEqual(self.entry_for(report)["artifacts"], len(entries))
+
+    def test_doctor_prose_mentions_what_could_not_be_determined(self):
+        self.install()
+        unreadable = next(e for e in self.installed_entries() if e.kind == "file")
+        self.refuse_to_probe_once_it_exists(unreadable.target)
+        _, report = self.run_cli("doctor")
+        self.assertIn(unreadable.id, cli._prose(report))
+
+    def test_doctor_never_writes(self):
+        self.install()
+        before = self.snapshot()
+        self.run_cli("doctor")
+        self.assertEqual(self.snapshot(), before)
+
+    def test_doctor_reports_a_damaged_journal_instead_of_dying(self):
+        """Every other command refuses outright against an unreadable
+        journal — that refusal is the fail-closed behaviour a hand-edit bug
+        or a corrupted write deserves. `doctor` is the one command a person
+        or an agent reaches for *because* something looks wrong, and it must
+        not die the same way: it is read-only, so degrading gracefully here
+        can never lose anything the way it would for a command that writes.
+        """
+        self.install()
+        self.store().path.write_bytes(b"{ not json")
+        code, report = self.run_cli("doctor")
+        self.assertEqual(code, 0)
+        self.assertNotIn("status", report)
+
+    def test_doctor_names_the_malformed_journals_own_path_and_complaint(self):
+        self.install()
+        self.store().path.write_bytes(b"{ not json")
+        _, report = self.run_cli("doctor")
+        self.assertEqual(report["journal_error"]["path"], str(self.store().path))
+        self.assertIn("not readable JSON", report["journal_error"]["error"])
+
+    def test_doctor_still_reports_what_it_can_affirm_without_the_journal(self):
+        """The binary version needs no journal at all, and detection reads
+        the real filesystem, not the journal -- both survive a journal that
+        cannot be read."""
+        self.install()
+        self.store().path.write_bytes(b"{ not json")
+        _, report = self.run_cli("doctor")
+        self.assertEqual(report["hpl_version"], hpl.__version__)
+        entry = next(item for item in report["clis"] if item["cli"] == CLI)
+        self.assertTrue(entry["detected"])
+        self.assertIsNotNone(entry["config_dir"])
+
+    def test_doctor_never_claims_not_installed_when_it_cannot_tell(self):
+        """`hpl_installed: false` is a claim that nothing is there. A
+        journal that cannot be read makes that claim untrue -- it might well
+        be installed -- so the per-CLI entry must say "unreadable", never
+        fabricate "not installed" in its place."""
+        self.install()
+        self.store().path.write_bytes(b"{ not json")
+        _, report = self.run_cli("doctor")
+        entry = next(item for item in report["clis"] if item["cli"] == CLI)
+        self.assertTrue(entry["journal_unreadable"])
+        self.assertNotIn("hpl_installed", entry)
+
+    def test_doctor_json_carries_the_malformed_journal_under_its_own_key(self):
+        """Following the pattern `mcp_granted` and `directories_granted`
+        already set: a machine-readable consumer gets its own key rather
+        than having to parse a sentence for the same fact."""
+        self.install()
+        self.store().path.write_bytes(b"{ not json")
+        _, report = self.run_cli("doctor")
+        self.assertIn("journal_error", report)
+        self.assertIn("path", report["journal_error"])
+        self.assertIn("error", report["journal_error"])
+
+    def test_doctor_prose_names_both_ways_back_from_a_malformed_journal(self):
+        self.install()
+        self.store().path.write_bytes(b"{ not json")
+        _, printed = self.run_prose("doctor")
+        self.assertIn("not readable JSON", printed)
+        self.assertIn("restore", printed)
+
+    def test_a_healthy_journal_carries_no_journal_error_key(self):
+        """No section anybody has to learn to ignore: absent when there is
+        nothing wrong to report, the same discipline `unaccounted` and
+        `pruned` already follow elsewhere in these reports."""
+        self.install()
+        _, report = self.run_cli("doctor")
+        self.assertNotIn("journal_error", report)
+        entry = next(item for item in report["clis"] if item["cli"] == CLI)
+        self.assertNotIn("journal_unreadable", entry)
+
+
+class UnprunableEmptyDirectoryReportTest(RealHomeTestCase):
+    """P5: `created_dirs` empty for a whole install made without that record means pruning
+    can never reach anything under it, forever -- and `doctor` used to say
+    nothing about the empty directories that leaves behind. It still never
+    prunes them here; it only names them, without claiming they are
+    HPL's own to reclaim.
+    """
+
+    def install(self):
+        self.present()
+        self.run_cli("install", "--cli", CLI)
+
+    def plant_untracked_empty_directory(self, name: str = "leftover-from-an-old-install") -> Path:
+        """A directory `created_dirs` never recorded -- the exact shape a
+        install made without that record leaves behind, without needing an
+        actual old release to reproduce it."""
+        directory = self.layout().config_dir / name
+        directory.mkdir()
+        return directory
+
+    def test_doctor_names_an_untracked_empty_directory(self):
+        self.install()
+        directory = self.plant_untracked_empty_directory()
+        _, report = self.run_cli("doctor")
+        entry = next(item for item in report["clis"] if item["cli"] == CLI)
+        self.assertIn(str(directory), entry["unprunable_empty_directories"])
+
+    def test_an_install_with_no_empty_directories_names_none(self):
+        self.install()
+        _, report = self.run_cli("doctor")
+        entry = next(item for item in report["clis"] if item["cli"] == CLI)
+        self.assertNotIn("unprunable_empty_directories", entry)
+
+    def test_a_directory_tracked_in_created_dirs_is_not_named_even_if_empty(self):
+        """A directory pruning *can* reach is not the P5 debt: it will be
+        taken back the next time something empties it out via `uninstall`,
+        so naming it here would be noise, not the gap this report exists
+        to close."""
+        self.install()
+        tracked = next(iter(journal_module.install_for(self.store().load(), CLI).created_dirs))
+        for child in list(tracked.iterdir()):
+            if child.is_file():
+                child.unlink()
+            else:
+                import shutil
+
+                shutil.rmtree(child)
+        _, report = self.run_cli("doctor")
+        entry = next(item for item in report["clis"] if item["cli"] == CLI)
+        self.assertNotIn(str(tracked), entry.get("unprunable_empty_directories", []))
+
+    def test_doctor_never_writes_or_removes_the_directories_it_names(self):
+        self.install()
+        directory = self.plant_untracked_empty_directory()
+        self.run_cli("doctor")
+        self.assertTrue(directory.exists())
+
+    def test_doctor_prose_is_descriptive_not_accusatory(self):
+        """No claim of ownership, no promise of a future cleanup -- only
+        that this install cannot confirm the directory as its own, and so
+        never prunes it."""
+        self.install()
+        self.plant_untracked_empty_directory()
+        _, printed = self.run_prose("doctor")
+        self.assertIn("cannot confirm", printed)
+        self.assertIn("never prunes", printed)
+
+    def test_doctor_prose_says_nothing_when_there_is_nothing_to_name(self):
+        self.install()
+        _, printed = self.run_prose("doctor")
+        self.assertNotIn("empty director", printed)
+
+
+class SnapshotTest(RealHomeTestCase):
+    """Order matters for one test here — a snapshot must reach disk before
+    the first artifact it protects — and mtimes are too coarse to prove
+    that on real disk, so this class runs on `RecordingFileSystem` instead
+    of the bare port. Every other test in it still asserts on real disk
+    state; the recorder only adds bookkeeping around the same real writes.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.filesystem = RecordingFileSystem()
+
+    def snapshots(self):
+        return cli.snapshot_store(self.runtime())
+
+    def test_a_dry_run_writes_no_snapshot(self):
+        self.present()
+        self.run_cli("install", "--cli", CLI, "--dry-run")
+        self.assertEqual(self.filesystem.list_dir(snapshots_root(self.filesystem, self.home)), [])
+
+    def test_installing_writes_a_snapshot_before_the_first_artifact_reaches_disk(self):
+        self.present()
+        self.run_cli("install", "--cli", CLI)
+        snapshot_index = next(
+            i for i, path in enumerate(self.filesystem.writes) if path.is_relative_to(snapshots_root(self.filesystem, self.home))
+        )
+        artifact_index = next(
+            i for i, path in enumerate(self.filesystem.writes) if path.is_relative_to(self.layout().config_dir)
+        )
+        self.assertLess(snapshot_index, artifact_index)
+
+    def test_the_snapshot_of_an_install_contains_the_journals_path(self):
+        self.present()
+        self.run_cli("install", "--cli", CLI)
+        manifest = self.snapshots().read(1)
+        self.assertIn(self.store().path, {entry.path for entry in manifest.entries})
+
+    def test_a_newly_created_file_is_captured_as_not_having_existed(self):
+        self.present()
+        self.run_cli("install", "--cli", CLI)
+        manifest = self.snapshots().read(1)
+        entry = next(e for e in manifest.entries if e.path == self.layout().system_prompt_file)
+        self.assertFalse(entry.existed)
+        self.assertIsNone(entry.mode)
+        self.assertIsNone(entry.blob)
+
+    def test_a_file_that_existed_before_is_captured_with_its_previous_bytes_and_mode(self):
+        self.present()
+        self.run_cli("install", "--cli", CLI)
+        before_content = self.store().path.read_bytes()
+        before_mode = stat.S_IMODE(self.store().path.stat().st_mode)
+
+        self.run_cli("install", "--cli", CLI)
+
+        manifest = self.snapshots().read(2)
+        entry = next(e for e in manifest.entries if e.path == self.store().path)
+        self.assertTrue(entry.existed)
+        self.assertEqual(entry.mode, f"{before_mode:04o}")
+        blob_path = self.snapshots().root / "000002" / entry.blob
+        self.assertEqual(blob_path.read_bytes(), before_content)
+
+    def test_uninstalling_writes_a_snapshot_too(self):
+        self.present()
+        self.run_cli("install", "--cli", CLI)
+        self.run_cli("uninstall", "--cli", CLI)
+        manifest = self.snapshots().read(2)
+        self.assertTrue(manifest.entries)
+
+    def test_when_the_snapshot_store_refuses_install_writes_nothing(self):
+        self.present()
+        root = snapshots_root(self.filesystem, self.home)
+        root.mkdir(parents=True, exist_ok=True)
+        restore = make_unreadable(root)
+        self.addCleanup(restore)
+
+        code, report = self.run_cli("install", "--cli", CLI)
+
+        restore()
+        self.assertNotEqual(code, 0)
+        self.assertEqual(report["status"], "failed")
+        self.assert_no_artifacts_written()
+        self.assertFalse(journal_path(self.filesystem, self.home).exists())
+        self.assertEqual(self.filesystem.list_dir(root), [])
+
+    def test_a_path_the_snapshot_cannot_probe_refuses_the_install_before_writing_anything(self):
+        """The acceptance test for the whole unit, at the command a person
+        actually runs.
+
+        Measured on real disk before this fix: `exists` swallowed `EACCES`
+        for an unreadable directory and answered `False`, so a snapshot
+        recorded files that were really there as absent, and `restore` later
+        deleted them while reporting success. `install` must refuse before a
+        single byte reaches disk instead — not merely produce a snapshot
+        that lies."""
+        self.present()
+        unreadable = self.layout().settings_file
+        restore = make_unreadable(unreadable.parent)
+        self.addCleanup(restore)
+
+        code, report = self.run_cli("install", "--cli", CLI)
+
+        restore()
+        self.assertNotEqual(code, 0)
+        self.assertEqual(report["status"], "failed")
+        self.assert_no_artifacts_written()
+        self.assertEqual(self.filesystem.list_dir(snapshots_root(self.filesystem, self.home)), [])
+
+    def test_when_the_snapshot_store_refuses_uninstall_removes_nothing(self):
+        """The way out needs the same guard as the way in.
+
+        Uninstalling deletes what the journal claims, so a run that cannot
+        capture first is a run that would destroy the only copy. Nothing is
+        removed and the journal still records the install, which is what lets
+        the user try again once whatever refused the snapshot is fixed.
+        """
+        self.present()
+        self.run_cli("install", "--cli", CLI)
+        surviving = self.snapshot()
+        restore = make_unreadable(snapshots_root(self.filesystem, self.home))
+        self.addCleanup(restore)
+
+        code, report = self.run_cli("uninstall", "--cli", CLI)
+
+        restore()
+        self.assertNotEqual(code, 0)
+        self.assertEqual(report["status"], "failed")
+        self.assertEqual(self.snapshot(), surviving)
+        self.assertIsNotNone(self.installed_entries())
+
+    def test_generation_numbers_advance_across_successive_commands(self):
+        self.present()
+        self.run_cli("install", "--cli", CLI)
+        self.run_cli("uninstall", "--cli", CLI)
+        self.assertIsNotNone(self.snapshots().read(1))
+        self.assertIsNotNone(self.snapshots().read(2))
+
+
+class RestoreTest(RealHomeTestCase):
+    def snapshots(self):
+        return cli.snapshot_store(self.runtime())
+
+    def test_restoring_returns_a_files_previous_bytes_and_mode_exactly(self):
+        self.present()
+        self.run_cli("install", "--cli", CLI)
+        target = self.layout().system_prompt_file
+        self.filesystem.write_atomic(target, b"hand-edited by the user", mode=0o600)
+        # Installing again overwrites the hand edit without asking, but not
+        # before this second snapshot captures it.
+        self.run_cli("install", "--cli", CLI)
+
+        code, report = self.run_cli("restore", "2")
+
+        self.assertEqual(code, 0)
+        self.assertEqual(target.read_bytes(), b"hand-edited by the user")
+        self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o600)
+        self.assertIn(str(target), report["written"])
+
+    def test_a_restore_that_fails_partway_says_what_it_already_changed(self):
+        """A command that wrote something must never report that it wrote nothing.
+
+        Restoring touches one address at a time, so a failure in the middle
+        leaves some of them already back at their previous contents. Reporting
+        that as "nothing was changed" would send the user looking for a problem
+        somewhere else, and would tell an agent that the filesystem is in a
+        state it is not in.
+        """
+        self.present()
+        self.run_cli("install", "--cli", CLI)
+        target = self.layout().system_prompt_file
+        self.filesystem.write_atomic(target, b"hand-edited by the user", mode=0o600)
+        self.run_cli("install", "--cli", CLI)
+        # The journal sorts after the prompt file, so the prompt is already back
+        # by the time this refusal lands.
+        self.addCleanup(self.make_journal_unwritable())
+
+        code, report = self.run_cli("restore", "2")
+
+        self.assertNotEqual(code, 0)
+        self.assertEqual(report["status"], "failed")
+        self.assertIn(str(target), report["written"])
+        self.assertNotIn("Nothing was changed", cli._prose(report))
+
+    def test_restoring_an_entry_recorded_as_absent_removes_the_path(self):
+        self.present()
+        self.run_cli("install", "--cli", CLI)
+        target = self.layout().system_prompt_file
+        self.assertTrue(target.exists())
+
+        code, report = self.run_cli("restore", "1")
+
+        self.assertEqual(code, 0)
+        self.assertFalse(target.exists())
+        self.assertIn(str(target), report["removed"])
+
+    def test_restoring_with_no_argument_picks_the_most_recent_readable_generation(self):
+        self.present()
+        self.run_cli("install", "--cli", CLI)
+        self.run_cli("install", "--cli", CLI)
+
+        code, report = self.run_cli("restore")
+
+        self.assertEqual(code, 0)
+        self.assertEqual(report["generation"], 2)
+
+    def test_restore_resolves_its_target_before_taking_its_own_snapshot(self):
+        """The trap: resolving "most recent" after the new snapshot is taken
+        would make restore recover its own copy of the present."""
+        self.present()
+        self.run_cli("install", "--cli", CLI)
+
+        code, report = self.run_cli("restore")
+
+        self.assertEqual(code, 0)
+        self.assertEqual(report["generation"], 1)
+
+    def test_restore_takes_its_own_snapshot(self):
+        self.present()
+        self.run_cli("install", "--cli", CLI)
+
+        self.run_cli("restore")
+
+        self.assertEqual(self.snapshots().readable_generations(), [1, 2])
+
+    def test_when_the_snapshot_store_refuses_restore_writes_nothing(self):
+        self.present()
+        self.run_cli("install", "--cli", CLI)
+        before = self.snapshot()
+        restore = make_unreadable(snapshots_root(self.filesystem, self.home))
+        self.addCleanup(restore)
+
+        code, report = self.run_cli("restore")
+
+        restore()
+        self.assertNotEqual(code, 0)
+        self.assertEqual(report["status"], "failed")
+        self.assertEqual(self.snapshot(), before)
+
+    def test_restoring_an_unreadable_generation_is_refused(self):
+        self.present()
+        self.run_cli("install", "--cli", CLI)
+        self.filesystem.make_dir(snapshots_root(self.filesystem, self.home) / "000002")
+
+        code, report = self.run_cli("restore", "2")
+
+        self.assertNotEqual(code, 0)
+        self.assertEqual(report["status"], "failed")
+
+    def test_restoring_with_nothing_ever_installed_is_refused(self):
+        self.present()
+        code, report = self.run_cli("restore")
+        self.assertNotEqual(code, 0)
+        self.assertEqual(report["status"], "failed")
+
+
+class RestoreListTest(RealHomeTestCase):
+    """`hpl restore --list`: a person is asked for a generation number
+    they had no way to discover before this existed."""
+
+    def test_listing_with_nothing_ever_installed_is_empty_not_a_failure(self):
+        self.present()
+        code, report = self.run_cli("restore", "--list")
+        self.assertEqual(code, 0)
+        self.assertEqual(report["generations"], [])
+
+    def test_listing_names_every_readable_generation_most_recent_first(self):
+        self.present()
+        self.run_cli("install", "--cli", CLI)
+        self.run_cli("install", "--cli", CLI)
+
+        code, report = self.run_cli("restore", "--list")
+
+        self.assertEqual(code, 0)
+        self.assertEqual([entry["generation"] for entry in report["generations"]], [2, 1])
+
+    def test_each_entry_carries_when_it_was_taken_and_what_it_touched(self):
+        self.present()
+        self.run_cli("install", "--cli", CLI)
+
+        code, report = self.run_cli("restore", "--list")
+
+        self.assertEqual(code, 0)
+        entry = report["generations"][0]
+        self.assertIn("taken_at", entry)
+        self.assertIn("files_restored", entry)
+        self.assertIn("paths_cleared", entry)
+
+    def test_an_unlabelled_generation_lists_with_no_label(self):
+        """A generation predating this field carries no `label` key at all --
+        every live command now supplies one (item B), so this hand-edits a
+        real manifest on disk to look like one written before this field
+        existed, the same way `ManifestLabelTest` does at the core level.
+        """
+        self.present()
+        self.run_cli("install", "--cli", CLI)
+        manifest_path = snapshots_root(self.filesystem, self.home) / "000001" / "manifest.json"
+        payload = json.loads(manifest_path.read_bytes())
+        self.assertEqual(payload.pop("label"), "install")
+        manifest_path.write_bytes(json.dumps(payload).encode("utf-8"))
+
+        code, report = self.run_cli("restore", "--list")
+
+        self.assertEqual(code, 0)
+        self.assertIsNone(report["generations"][0]["label"])
+
+    def test_a_labelled_generation_lists_its_label(self):
+        self.present()
+        self.run_cli("install", "--cli", CLI)
+        self.run_cli("update", "--cli", CLI)
+
+        code, report = self.run_cli("restore", "--list")
+
+        self.assertEqual(code, 0)
+        by_generation = {entry["generation"]: entry["label"] for entry in report["generations"]}
+        self.assertEqual(by_generation[1], "install")
+        self.assertEqual(by_generation[2], "update")
+
+    def test_listing_writes_nothing_and_restores_nothing(self):
+        self.present()
+        self.run_cli("install", "--cli", CLI)
+        before = self.snapshot()
+
+        self.run_cli("restore", "--list")
+
+        self.assertEqual(self.snapshot(), before)
+        self.assertEqual(cli.snapshot_store(self.runtime()).readable_generations(), [1])
+
+    def test_list_together_with_a_generation_number_is_refused(self):
+        self.present()
+        self.run_cli("install", "--cli", CLI)
+
+        code, report = self.run_cli("restore", "1", "--list")
+
+        self.assertNotEqual(code, 0)
+        self.assertEqual(report["status"], "failed")
+
+    def test_prose_names_the_generation_the_taken_at_and_the_label(self):
+        self.present()
+        self.run_cli("install", "--cli", CLI)
+
+        code, printed = self.run_prose("restore", "--list")
+
+        self.assertEqual(code, 0)
+        self.assertIn("generation 1", printed)
+        self.assertIn("install", printed)
+
+    def test_prose_with_nothing_to_restore_says_so(self):
+        self.present()
+        _, printed = self.run_prose("restore", "--list")
+        self.assertIn("no snapshot generation", printed)
+
+    def test_an_unreadable_generation_is_named_apart_rather_than_hidden(self):
+        """A generation whose folder holds a manifest that exists but will
+        not parse -- `readable_generations` only checks presence, so this is
+        the one case `restore --list`'s own read of the manifest still has
+        to catch, the same asymmetry `session._generation_summaries`
+        documents for the TUI's identical screen.
+        """
+        self.present()
+        self.run_cli("install", "--cli", CLI)
+        self.run_cli("install", "--cli", CLI)
+        broken = snapshots_root(self.filesystem, self.home) / "000002" / "manifest.json"
+        self.filesystem.write_atomic(broken, b"not json", mode=0o600)
+
+        code, report = self.run_cli("restore", "--list")
+
+        self.assertEqual(code, 0)
+        self.assertEqual([entry["generation"] for entry in report["generations"]], [1])
+        self.assertEqual(report["unreadable"], [2])
+
+
+class RetentionTest(RealHomeTestCase):
+    def snapshots(self):
+        return cli.snapshot_store(self.runtime())
+
+    def test_one_generation_past_the_kept_count_deletes_the_first_and_the_rest_remain(self):
+        self.present()
+        total = cli.RETAIN_GENERATIONS + 1
+        for _ in range(total):
+            self.run_cli("install", "--cli", CLI)
+        self.assertEqual(self.snapshots().readable_generations(), list(range(2, total + 1)))
+
+    def test_retention_run_twice_does_not_fail(self):
+        self.present()
+        for _ in range(cli.RETAIN_GENERATIONS + 1):
+            self.run_cli("install", "--cli", CLI)
+        code, report = self.run_cli("uninstall", "--cli", CLI)
+        self.assertEqual(code, 0)
+        self.assertEqual(report["retention"]["failed"], [])
+
+
+class RetentionOnTheDoubleTest(FakeHomeTestCase):
+    """One retention failure real permissions cannot reproduce.
+
+    Making generation 1's removal fail while leaving generation 6's own
+    creation unaffected needs the two to answer to different permissions,
+    but both are a write to the very same parent directory — `snapshots/` —
+    on a real POSIX filesystem, so no chmod can separate them. Locking that
+    directory to block the removal blocks the new generation's own folder
+    too, which fails the run before retention ever runs, for a different
+    reason than the one this test exists to prove. The double can still tell
+    the two apart, so this one test stays on it rather than being weakened
+    into asserting something else.
+    """
+
+    def snapshots(self):
+        return cli.snapshot_store(self.runtime())
+
+    def test_a_retention_failure_leaves_the_command_successful_and_is_still_reported(self):
+        self.present()
+        for _ in range(cli.RETAIN_GENERATIONS):
+            self.run_cli("install", "--cli", CLI)
+        self.filesystem.fail_remove_dir.add(snapshots_root(self.filesystem, self.home) / "000001")
+
+        code, report = self.run_cli("install", "--cli", CLI)
+
+        self.assertEqual(code, 0)
+        self.assertEqual(report["status"], "installed")
+        self.assertTrue(report["retention"]["failed"])
+        self.assertIn(1, self.snapshots().readable_generations())
+
+
+class HumanOutputTest(RealHomeTestCase):
+    def test_without_json_the_output_is_prose_and_not_a_document(self):
+        self.present()
+        context = self.runtime()
+        code = cli.main(["doctor"], runtime=context)
+        written = context.out.getvalue()
+        self.assertEqual(code, 0)
+        self.assertTrue(written.strip())
+        with self.assertRaises(json.JSONDecodeError):
+            json.loads(written)
+
+    def test_a_failure_says_what_went_wrong_in_prose_too(self):
+        self.present()
+        context = self.runtime()
+        code = cli.main(["uninstall", "--cli", CLI], runtime=context)
+        self.assertNotEqual(code, 0)
+        self.assertIn(CLI, context.out.getvalue())
+
+    def test_prose_does_not_claim_nothing_changed_when_something_was_left_behind(self):
+        self.present()
+        self.addCleanup(self.make_journal_unwritable())
+        context = self.runtime()
+        cli.main(["install", "--cli", CLI], runtime=context)
+        self.assertNotIn("Nothing was changed", context.out.getvalue())
+
+
+class ActivationTest(RealHomeTestCase):
+    """Writing the files is not the same as the CLI having read them.
+
+    A CLI that loads its configuration once, at startup, keeps running on what it
+    read before the install. Reporting success without saying so leaves the user
+    looking at an installation that is on disk and inert.
+    """
+
+    def test_install_reports_what_is_left_for_the_user_to_do(self):
+        self.present()
+        _, report = self.run_cli("install", "--cli", CLI)
+        self.assertTrue(report["activation"], "the adapter contributed no activation step")
+
+    def test_a_dry_run_says_it_too_because_it_is_the_same_installation(self):
+        self.present()
+        _, report = self.run_cli("install", "--cli", CLI, "--dry-run")
+        self.assertTrue(report["activation"])
+
+    def test_uninstall_says_it_as_well(self):
+        self.present()
+        self.run_cli("install", "--cli", CLI)
+        _, report = self.run_cli("uninstall", "--cli", CLI)
+        self.assertTrue(report["activation"])
+
+    def test_doctor_says_it_too_because_that_is_why_people_run_doctor(self):
+        """An unread configuration is exactly what makes an install look inert."""
+        self.present()
+        self.run_cli("install", "--cli", CLI)
+        _, report = self.run_cli("doctor")
+        self.assertTrue(cli_entry(report)["activation"])
+
+    def test_doctor_stays_quiet_when_hpl_is_not_installed(self):
+        self.present()
+        _, report = self.run_cli("doctor")
+        self.assertNotIn("activation", cli_entry(report))
+
+    def test_the_prose_carries_it_because_prose_is_never_a_subset(self):
+        self.present()
+        context = self.runtime()
+        cli.main(["install", "--cli", CLI], runtime=context)
+        written = context.out.getvalue()
+        for step in available().get(CLI).activation_steps():
+            self.assertIn(step, written)
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+class TerminalTest(unittest.TestCase):
+    """Whether there is a person at a screen, which is what decides whether
+    asking for nothing shows a menu or a usage line."""
+
+    def test_a_closed_stream_is_nobody_rather_than_an_exception(self):
+        """`isatty` raises on a closed file, and that is an answer, not a
+        failure: a run whose input is gone has no one to show a menu to."""
+        closed = io.StringIO()
+        closed.close()
+        with mock.patch.object(cli.sys, "stdin", closed), mock.patch.object(cli.sys, "stdout", closed):
+            self.assertFalse(cli._attached_to_a_terminal())
+
+    def test_a_redirected_output_is_not_a_terminal_even_with_a_real_stdin(self):
+        both = [_Stream(True), _Stream(False)]
+        with mock.patch.object(cli.sys, "stdin", both[0]), mock.patch.object(cli.sys, "stdout", both[1]):
+            self.assertFalse(cli._attached_to_a_terminal())
+
+    def test_both_ends_at_a_terminal_is_a_person(self):
+        with mock.patch.object(cli.sys, "stdin", _Stream(True)), mock.patch.object(
+            cli.sys, "stdout", _Stream(True)
+        ):
+            self.assertTrue(cli._attached_to_a_terminal())
+
+
+class _Stream:
+    def __init__(self, terminal: bool):
+        self._terminal = terminal
+
+    def isatty(self) -> bool:
+        return self._terminal
+
+
+class _BlockCurses:
+    """A `sys.meta_path` finder that makes `import curses` fail exactly the
+    way it does on a Python built without the `_curses` extension: a real
+    `ModuleNotFoundError` naming `_curses`, not a stand-in exception -- see
+    `tests/test_cli_without_curses.py` for the full-process version of the
+    same fault, reproduced there via subprocess instead of module patching."""
+
+    def find_spec(self, name, path=None, target=None):
+        if name == "curses" or name.startswith("curses."):
+            raise ModuleNotFoundError("No module named '_curses'", name="_curses")
+        return None
+
+
+class MissingCursesTest(unittest.TestCase):
+    """The one place `main()` opens the TUI: what it does when `curses` --
+    imported lazily, on purpose, so every other command stays unaffected --
+    turns out not to exist on this interpreter."""
+
+    def _forget_tui_app(self):
+        """`hpl.tui.app` (and `curses` itself) must be re-imported for the
+        blocked finder to have anything to intercept; a module already
+        cached in `sys.modules` from an earlier test would make this test
+        vacuous.
+
+        `sys.modules` alone is not enough: on a real machine (this one has a
+        working `_curses`), some earlier test already imported
+        `hpl.tui.app` for real, and a successful `import a.b.c` also sets
+        `b.c` as an attribute on module `a.b` -- so `from hpl.tui import
+        app` would read that stale, fully-real attribute straight off the
+        `hpl.tui` package and never touch `sys.modules` or a single
+        meta-path finder at all. The first version of this test missed
+        exactly that: it let a real `tui_app.main()` run in-process, with no
+        real terminal underneath it, wrecking the test process's own stdout
+        with raw curses escape codes. `hpl.tui.app`'s own attribute is
+        cleared here too, so the import machinery is forced to run for
+        real."""
+        tui_package = sys.modules.get("hpl.tui")
+        had_app_attribute = tui_package is not None and hasattr(tui_package, "app")
+        previous_app_attribute = getattr(tui_package, "app", None) if had_app_attribute else None
+        if had_app_attribute:
+            delattr(tui_package, "app")
+
+        def _restore_app_attribute():
+            if had_app_attribute:
+                tui_package.app = previous_app_attribute
+
+        self.addCleanup(_restore_app_attribute)
+
+        removed = {
+            name: module
+            for name, module in sys.modules.items()
+            if name == "curses" or name.startswith("curses.")
+            or name == "hpl.tui.app" or name.startswith("hpl.tui.app.")
+        }
+        for name in removed:
+            del sys.modules[name]
+        self.addCleanup(sys.modules.update, removed)
+
+    def test_reports_an_honest_message_instead_of_a_traceback(self):
+        self._forget_tui_app()
+        finder = _BlockCurses()
+        cli.sys.meta_path.insert(0, finder)
+        self.addCleanup(cli.sys.meta_path.remove, finder)
+
+        out = io.StringIO()
+        runtime = replace(cli.default_runtime(out), out=out)
+        with mock.patch.object(cli, "_attached_to_a_terminal", return_value=True):
+            code = cli.main([], runtime=runtime)
+
+        self.assertEqual(code, cli.FAILED)
+        message = out.getvalue()
+        self.assertIn("_curses", message)
+        self.assertIn(runtime.identity.program_name, message)
+        self.assertNotIn("Traceback", message)
+
+    def test_an_unrelated_missing_module_is_not_swallowed(self):
+        """Only `_curses` gets the honest rewrite -- any other
+        `ModuleNotFoundError` raised while importing the TUI is a real bug
+        and must still surface as itself."""
+        self._forget_tui_app()
+
+        class _BlockSomethingElse:
+            def find_spec(self, name, path=None, target=None):
+                if name == "hpl.tui.app":
+                    raise ModuleNotFoundError("No module named 'nonexistent_thing'", name="nonexistent_thing")
+                return None
+
+        finder = _BlockSomethingElse()
+        cli.sys.meta_path.insert(0, finder)
+        self.addCleanup(cli.sys.meta_path.remove, finder)
+
+        runtime = cli.default_runtime(io.StringIO())
+        with mock.patch.object(cli, "_attached_to_a_terminal", return_value=True):
+            with self.assertRaises(ModuleNotFoundError) as raised:
+                cli.main([], runtime=runtime)
+        self.assertEqual(raised.exception.name, "nonexistent_thing")
+
+    def test_missing_curses_message_names_cause_meaning_and_remedy(self):
+        identity = cli.default_identity()
+        message = cli._missing_curses_message(identity)
+        self.assertIn("_curses", message)
+        self.assertIn("ncurses", message)
+        self.assertIn(identity.program_name, message)
+        self.assertTrue(message[0].islower())
+
+
+class FailurePrefixCompositionTest(unittest.TestCase):
+    """`_prose` prefixes a failed command's own `CommandError` text with a
+    sentence of its own -- "Nothing was changed", "Stopped after changing
+    N", "The installation was undone" -- and every `CommandError` in this
+    codebase starts lowercase on purpose, so it can be chained after
+    whatever composes it (see `CommandError`'s own docstring). Composing
+    the two with ". " leaves a capital sentence butting straight into a
+    lowercase one, which reads as a typo. This is not one message's
+    problem: it is what happens to *any* `CommandError` placed after that
+    prefix, `upgrade`'s and `mcp`'s among them.
+
+    The prefix's own punctuation is what has to change, not the message: a
+    `CommandError` can (and does) start with a filesystem path -- see
+    `upgrade`'s own writability refusal -- and upper-casing an arbitrary
+    first character would corrupt one that happened to start with a
+    lowercase path segment.
+    """
+
+    def test_a_refusal_with_nothing_written_reads_as_one_sentence(self):
+        report = {"status": "failed", "error": "chose unknown mcp server(s) context7,playwright"}
+        prose = cli._prose(report)
+        self.assertNotRegex(prose, r"\.\s+[a-z]")
+        self.assertIn("chose unknown mcp server(s) context7,playwright", prose)
+
+    def test_a_refusal_beginning_with_a_path_is_not_corrupted(self):
+        message = "/opt/hpl/hpl is not writable by this process; upgrade refuses to download anything"
+        report = {"status": "failed", "error": message}
+        prose = cli._prose(report)
+        self.assertIn(message, prose)
+
+    def test_a_partial_failure_also_reads_as_one_sentence(self):
+        report = {
+            "status": "failed",
+            "error": "the journal could not be written",
+            "written": ["a", "b"],
+        }
+        prose = cli._prose(report)
+        self.assertNotRegex(prose, r"\.\s+[a-z]")
+
+    def test_a_rolled_back_failure_also_reads_as_one_sentence(self):
+        report = {"status": "failed", "rolled_back": True, "error": "retiring context7 failed"}
+        prose = cli._prose(report)
+        self.assertNotRegex(prose, r"\.\s+[a-z]")

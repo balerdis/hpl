@@ -1,0 +1,1350 @@
+"""The rule that keeps the abstraction from rotting.
+
+The engine must not know which CLIs exist. This test derives the list of CLI
+identifiers from the adapter directories themselves, so it keeps working as
+adapters are added without anyone remembering to update it.
+"""
+from __future__ import annotations
+
+import ast
+import re
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+from brand_fragments import BANNED_FRAGMENTS
+from test_cli_identity_sweep import ACME_IDENTITY
+
+SOURCE = Path(__file__).resolve().parents[1] / "src" / "hpl"
+ADAPTERS = SOURCE / "adapters"
+CLI_AGNOSTIC_PACKAGES = ("core", "ports", "infra", "tui")
+#: `NoProductIdentityOutsideCompositionRootTest`'s own scan list -- deliberately
+#: not `CLI_AGNOSTIC_PACKAGES` above, even though it starts from the same four
+#: packages. `adapters/` legitimately names *CLIs* (that is its entire job, and
+#: exactly what `NoCliNamesOutsideAdaptersTest` uses `CLI_AGNOSTIC_PACKAGES` to
+#: keep out of everything else), but it must never know which *distribution* it
+#: is running under -- a distinct question this tuple answers on its own.
+PRODUCT_IDENTITY_PACKAGES = CLI_AGNOSTIC_PACKAGES + ("adapters",)
+PERMISSION_FREE_PACKAGES = ("core", "ports")
+OCTAL_PERMISSION_LITERAL = re.compile(r"^0[oO][0-7]{3,4}$")
+
+
+def cli_ids() -> tuple[str, ...]:
+    return tuple(
+        sorted(
+            item.name
+            for item in ADAPTERS.iterdir()
+            if item.is_dir() and not item.name.startswith("_") and item.name != "__pycache__"
+        )
+    )
+
+
+def agnostic_modules() -> list[Path]:
+    return sorted(
+        path
+        for package in CLI_AGNOSTIC_PACKAGES
+        for path in (SOURCE / package).rglob("*.py")
+        if "__pycache__" not in path.parts
+    )
+
+
+def product_identity_modules() -> list[Path]:
+    return sorted(
+        path
+        for package in PRODUCT_IDENTITY_PACKAGES
+        for path in (SOURCE / package).rglob("*.py")
+        if "__pycache__" not in path.parts
+    )
+
+
+class NoCliNamesOutsideAdaptersTest(unittest.TestCase):
+    def test_at_least_one_adapter_exists(self):
+        """Without this, the test below would pass by finding nothing to look for."""
+        self.assertTrue(cli_ids(), "no adapter directories found under src/hpl/adapters")
+
+    def test_agnostic_packages_are_scanned(self):
+        self.assertTrue(agnostic_modules(), "no modules found in the CLI-agnostic packages")
+
+    def test_no_agnostic_module_names_a_cli(self):
+        offenders = [
+            f"{path.relative_to(SOURCE)}:{number} mentions {cli_id!r}"
+            for path in agnostic_modules()
+            for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1)
+            for cli_id in cli_ids()
+            if cli_id in line.lower()
+        ]
+        self.assertEqual(
+            offenders,
+            [],
+            "CLI-specific knowledge leaked out of adapters/:\n" + "\n".join(offenders),
+        )
+
+
+class AdapterIsolationTest(unittest.TestCase):
+    """One adapter must not depend on another, or the abstraction has no boundary.
+
+    Files sitting directly under `adapters/` are exempt: that is the composition
+    root, and knowing every adapter is its whole job.
+    """
+
+    def test_no_adapter_imports_another_adapter(self):
+        offenders = [
+            f"{path.relative_to(SOURCE)}:{number}"
+            for path in sorted(ADAPTERS.rglob("*.py"))
+            if "__pycache__" not in path.parts and _owning_adapter(path)
+            for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1)
+            for other in cli_ids()
+            if other != _owning_adapter(path) and f"adapters.{other}" in line
+        ]
+        self.assertEqual(offenders, [], "adapters must not depend on each other")
+
+    def test_the_composition_root_is_the_only_place_that_knows_every_adapter(self):
+        root = (ADAPTERS / "__init__.py").read_text(encoding="utf-8")
+        for cli_id in cli_ids():
+            self.assertIn(cli_id, root, f"{cli_id} is not registered in the composition root")
+
+
+def permission_free_modules() -> list[Path]:
+    return sorted(
+        path
+        for package in PERMISSION_FREE_PACKAGES
+        for path in (SOURCE / package).rglob("*.py")
+        if "__pycache__" not in path.parts
+    )
+
+
+class NoPermissionOctalLiteralsTest(unittest.TestCase):
+    """A POSIX mode is a platform detail; naming one as a bare literal in
+    `core/` or `ports/` is exactly the leak this design closes.
+
+    Two kinds of octal are not that leak, and the rule has to let them
+    through or it makes the code worse to satisfy itself. Prose that
+    mentions a mode is one: reading the source as a syntax tree means a
+    docstring is a string and never a number, so it cannot be mistaken for
+    a value. A range bound is the other — `0 <= mode <= 0o777` does not
+    choose a permission, it refuses the values that are not one, and
+    deleting that check to keep this test quiet would trade a real
+    guarantee for a green light. So a literal standing in a range bound
+    (`<`, `<=`, `>`, `>=`) is not an offender.
+
+    An equality is not a bound, and this test does not treat it as one: `if
+    filesystem.mode_of(path) == 0o644` chooses a permission exactly as much
+    as `mode = 0o644` does, just spelled as a question. Exempting every
+    literal beside a comparison operator, of any kind, would have reopened
+    the leak this test exists to close the moment `mode` stopped being an
+    `int` the engine could assign directly.
+    """
+
+    def test_permission_free_packages_are_scanned(self):
+        self.assertTrue(permission_free_modules(), "no modules found under core/ or ports/")
+
+    def test_no_permission_octal_literal_under_core_or_ports(self):
+        offenders = [
+            f"{path.relative_to(SOURCE)}:{line} literal {text!r}"
+            for path in permission_free_modules()
+            for line, text in _chosen_permissions(path)
+        ]
+        self.assertEqual(
+            offenders,
+            [],
+            "a permission octal literal leaked into core/ or ports/:\n" + "\n".join(offenders),
+        )
+
+    def test_a_range_bound_is_not_flagged(self):
+        offenders = _chosen_permissions(_write_probe(self, "assert 0 <= mode <= 0o777\n"))
+        self.assertEqual(offenders, [])
+
+    def test_an_equality_against_a_chosen_permission_is_flagged(self):
+        """The gap a naive `it's inside a comparison` exemption would reopen:
+        asking `mode_of(path) == 0o644` chooses 0o644 exactly as much as
+        assigning it would, so this must still be caught."""
+        offenders = _chosen_permissions(_write_probe(self, "chosen = mode_of(path) == 0o644\n"))
+        self.assertEqual([text for _, text in offenders], ["0o644"])
+
+
+def _write_probe(test: unittest.TestCase, source: str) -> Path:
+    directory = tempfile.TemporaryDirectory()
+    test.addCleanup(directory.cleanup)
+    probe = Path(directory.name) / "probe.py"
+    probe.write_text(source, encoding="utf-8")
+    return probe
+
+
+_RANGE_OPS = (ast.Lt, ast.LtE, ast.Gt, ast.GtE)
+
+
+def _chosen_permissions(path: Path) -> list[tuple[int, str]]:
+    """Every octal literal in the file that names a permission it chose."""
+    source = path.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    bounds = {
+        id(literal)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Compare) and all(isinstance(op, _RANGE_OPS) for op in node.ops)
+        for literal in (node.left, *node.comparators)
+    }
+    found = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Constant) or not isinstance(node.value, int) or id(node) in bounds:
+            continue
+        text = ast.get_source_segment(source, node) or ""
+        if OCTAL_PERMISSION_LITERAL.match(text):
+            found.append((node.lineno, text))
+    return sorted(found)
+
+
+#: The three pure `tui` modules -- see each one's own module docstring for
+#: the promise: given the same input they always return the same value, and
+#: nothing in them can fail for lack of a terminal. `tui/app.py` is the one
+#: module in this package explicitly exempted: it already owns the real
+#: clock for its animation frame loop (`time.monotonic()` driving
+#: `PROGRESS_TICK_MS`) and is where a download's bytes/second rate is
+#: computed for exactly that reason -- see `_DownloadRateTracker`'s own
+#: docstring. `tui/session.py` is impure too (it bridges to `cli`) but reads
+#: no clock today, so it is left out of this rule rather than exempted from
+#: it: adding it back the moment it does read one is exactly the point.
+PURE_TUI_MODULE_NAMES = ("navigator.py", "view.py", "wordmark.py")
+
+
+def deterministic_modules() -> list[Path]:
+    """Every module this suite requires to stay clock-free: all of `core/`,
+    plus the pure trio under `tui/` named above. `ports/` and `infra/` are
+    deliberately absent -- a port may describe a clock-shaped capability and
+    an adapter may read a real one (`infra/mcp_process_subprocess.py` times
+    out a subprocess this way today, entirely legitimately), and neither is
+    the boundary this test exists to guard.
+    """
+    core_modules = sorted(path for path in (SOURCE / "core").rglob("*.py") if "__pycache__" not in path.parts)
+    pure_tui_modules = [SOURCE / "tui" / name for name in PURE_TUI_MODULE_NAMES]
+    return core_modules + pure_tui_modules
+
+
+#: `(owner, attribute)` pairs that read the current wall-clock or monotonic
+#: time -- as opposed to `datetime.fromisoformat`, which both `navigator.py`
+#: and `tui/session.py` already call today to parse a timestamp they were
+#: handed, never to ask what time it is right now. That distinction is the
+#: whole reason this test matches specific call shapes with `ast.Call`
+#: rather than merely forbidding the word "datetime" or "time" outright --
+#: the latter would also forbid a module from parsing a string one of its
+#: own callers already read off a real clock somewhere else.
+_CLOCK_READ_CALLS = {
+    ("time", "time"),
+    ("time", "monotonic"),
+    ("time", "monotonic_ns"),
+    ("time", "perf_counter"),
+    ("time", "perf_counter_ns"),
+    ("datetime", "now"),
+    ("datetime", "utcnow"),
+}
+
+
+def _clock_reads(path: Path) -> list[tuple[int, str]]:
+    """Every line in `path` that imports the `time` module outright, or calls
+    one of `_CLOCK_READ_CALLS` -- an `import time`/`from time import ...` is
+    flagged unconditionally, on the same reasoning `NoPermissionOctalLiteralsTest`
+    already applies to a bare octal: a module with no legitimate reason to
+    read a clock has no legitimate reason to import the module that would let
+    it, either.
+    """
+    source = path.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    offenders: list[tuple[int, str]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name == "time":
+                    offenders.append((node.lineno, "import time"))
+        elif isinstance(node, ast.ImportFrom):
+            if node.module == "time":
+                offenders.append((node.lineno, "from time import ..."))
+        elif isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            owner = node.func.value
+            if isinstance(owner, ast.Name) and (owner.id, node.func.attr) in _CLOCK_READ_CALLS:
+                offenders.append((node.lineno, f"{owner.id}.{node.func.attr}(...)"))
+    return sorted(offenders)
+
+
+class NoClockReadsInDeterministicModulesTest(unittest.TestCase):
+    """`core/` and the pure trio under `tui/` must produce the same output
+    for the same input, forever -- that promise is what lets every one of
+    them be proven by a table of canned answers instead of a real clock or a
+    real terminal. A download's transfer rate is bytes divided by elapsed
+    wall-clock time, which needs a clock read from *somewhere*, and
+    `tui/app.py` is the one and only correct place for that read to live: it
+    already owns a real clock for its animation frame loop, and it is the
+    only layer that observes a `Progress` live off a worker thread rather
+    than replaying one from a finished report. Moving that read into `core/`
+    or `cli.py` would make the engine's own output depend on how much real
+    time happened to pass while a caller was watching it -- breaking `--json`
+    and every dry run, which read the very same `Progress` and must not
+    depend on wall-clock time at all. Moving it into a pure `tui` module
+    would break the same promise one layer up: `view.py` renders only
+    numbers already computed, on purpose, so a screenshot test can hand it
+    two different `Progress` values and expect two different outputs with no
+    clock, no thread, and no sleep anywhere involved.
+
+    This test exists so that the next person who finds a rate computed in
+    the wrong place and "simplifies" it by moving the clock read closer to
+    where the number is used gets a failing test instead of a silent
+    architecture decay.
+    """
+
+    def test_deterministic_packages_are_scanned(self):
+        self.assertTrue(deterministic_modules(), "no modules found under core/ or the pure tui trio")
+
+    def test_no_clock_read_under_core_or_the_pure_tui_modules(self):
+        offenders = [
+            f"{path.relative_to(SOURCE)}:{line} reads a clock via {text}"
+            for path in deterministic_modules()
+            for line, text in _clock_reads(path)
+        ]
+        self.assertEqual(
+            offenders,
+            [],
+            "a clock read leaked into core/ or a pure tui module:\n" + "\n".join(offenders),
+        )
+
+    def test_a_parsed_timestamp_is_not_flagged(self):
+        """`datetime.fromisoformat(taken_at)` reads a string, not a clock --
+        the exact case `navigator.py` and `tui/session.py` already rely on."""
+        offenders = _clock_reads(_write_probe(self, "from datetime import datetime\ndatetime.fromisoformat(taken_at)\n"))
+        self.assertEqual(offenders, [])
+
+    def test_a_bare_import_of_time_is_flagged_even_if_unused_so_far(self):
+        offenders = _clock_reads(_write_probe(self, "import time\n"))
+        self.assertEqual(offenders, [(1, "import time")])
+
+    def test_time_monotonic_is_flagged(self):
+        offenders = _clock_reads(_write_probe(self, "import time\nstarted = time.monotonic()\n"))
+        self.assertEqual([text for _, text in offenders], ["import time", "time.monotonic(...)"])
+
+    def test_datetime_now_is_flagged(self):
+        offenders = _clock_reads(_write_probe(self, "from datetime import datetime, timezone\ndatetime.now(timezone.utc)\n"))
+        self.assertEqual([text for _, text in offenders], ["datetime.now(...)"])
+
+    def test_app_py_is_not_scanned_at_all(self):
+        """The one exemption this rule names explicitly -- see
+        `deterministic_modules`'s own docstring for why `tui/app.py` is
+        where a download's rate belongs, clock read and all."""
+        self.assertNotIn(SOURCE / "tui" / "app.py", deterministic_modules())
+
+
+#: Every string this rule already knows may say `hpl`/`harness`/`balerdis`
+#: without naming a distribution -- because it is a wire-format identifier an
+#: external reader parses (a schema string, a canonical-frame path segment, a
+#: dict key mirroring a dataclass field name), never a brand a person reads.
+#: Exact match only: a real offender's full string is never equal to one of
+#: these, so no partial-match rule is needed to tell the two apart.
+PRODUCT_IDENTITY_ALLOWLIST = frozenset(
+    {
+        "hpl/capability-manifest/v1",
+        "hpl/model-assignment/v1",
+        "hpl/artifact-catalog/v4",
+        "hpl/journal/v4",
+        # The JSON key that mirrors the `hpl_version` dataclass field --
+        # renaming either would break every journal already on disk for zero
+        # user-visible benefit.
+        "hpl_version",
+        "the journal needs a hpl_version",
+        # The fictional canonical frame a catalog is built against so its
+        # digests are portable across machines -- changing either changes every
+        # artifact digest ever published, not just what a person reads.
+        "/hpl/catalog-build",
+        ".hpl-data",
+        # A probe home nothing on disk can ever equal, used only to prove a
+        # registry answers "not found" -- never resolved against a real path.
+        "/nonexistent/hpl-registry-probe",
+        # The `clientInfo.name` this engine sends every third-party MCP server
+        # during the `initialize` handshake -- engine plumbing, not product
+        # identity, the same treatment already given to `hpl_version` and
+        # `HPL_SKILL_REGISTRY_BIN`: it never varies with which
+        # distribution runs.
+        "hpl-doctor",
+        # The wire-format name of a substituted credential, `$HPL_SECRET_<NAME>`:
+        # a token the model sees and a shell expands, shared by every
+        # distribution on this engine (see the exemption note for the
+        # secret-transport plugin). The Claude Code engram hook script builds the
+        # same token when it redacts a prompt.
+        "$HPL_SECRET_",
+        # The prefix an orphaned half-finished atomic write's temp file is
+        # named with -- same reasoning as `"hpl-doctor"` just above: an
+        # operator identifying a stray `.hpl-*` file needs this name
+        # stable, never parameterized on which distribution wrote it.
+        ".hpl-",
+        # Env var names the OpenCode adapter writes into installed config for
+        # the skill-registry plugin to read back -- same wire-plumbing
+        # treatment as `"hpl-doctor"` above: they never vary with which
+        # distribution installed them.
+        "HPL_SKILL_REGISTRY_BIN",
+        "HPL_SKILL_ROOTS",
+        # `layout.py`'s own identity-unaware default for the system prompt's
+        # filename -- not a brand baked into what actually installs any more
+        # (`render.system_prompt` derives the real, identity-branded name
+        # from `Identity.program_name` directly, never from this constant).
+        # `Layout` is built in many places that carry no `Identity` at all
+        # (see `adapter.layout`'s callers), so this stays as the one literal
+        # default a `Layout` can answer on its own -- correct only for the
+        # packaged distribution, and consulted for nothing but that.
+        "hpl-AGENTS.md",
+        # The same idea again, for the Claude Code adapter's own layout: its
+        # own identity-unaware default for the system prompt's filename,
+        # never consulted for what `render.system_prompt` actually writes
+        # (that function derives the real name from `Identity.program_name`
+        # directly, the same way OpenCode's `render.system_prompt` does).
+        "hpl.md",
+    }
+)
+
+
+def _fold_string_concat(node: ast.AST) -> str | None:
+    """The compile-time value of `node` if it is a string literal, or a `+`
+    chain of string literals, else `None`. Mirrors what Python's own constant
+    folding does at runtime for `"a" + "b"`, so the offender scan can match
+    against the same value a reader of the running program would see -- not
+    against the two halves the source happens to spell it with."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left = _fold_string_concat(node.left)
+        right = _fold_string_concat(node.right)
+        if left is not None and right is not None:
+            return left + right
+    return None
+
+
+def _this_engine_identity():
+    """This repository's own packaged identity, parsed the same way the
+    running product would read it -- never copied as a literal, for the same
+    reason `_engine_brand_fragments()` above reads it instead of hardcoding
+    "hpl"/"harness"."""
+    from hpl.core import identity as identity_module
+
+    return identity_module.parse((SOURCE / "identity.json").read_bytes())
+
+
+def _product_identity_fragments(identity) -> tuple[str, ...]:
+    """The full vocabulary `NoProductIdentityOutsideCompositionRootTest` watches
+    for: `BANNED_FRAGMENTS` unioned with whatever `identity` itself names --
+    `product_id`, `display_name`, `program_name`, and every `wordmark_words`
+    entry, all lower-cased.
+
+    Before this, the guardian matched against `BANNED_FRAGMENTS` alone -- a
+    tuple typed by hand to spell HPL's own brand. That made the guardian
+    correct for this repository only by coincidence: its author and this
+    engine's identity happen to agree. A fork whose `identity.json` names a
+    different product was left watching for a brand it does not have, and
+    blind to the one it does -- exactly the hole this function closes by
+    deriving the identity half from `identity.parse()` instead of a second
+    hand-typed copy.
+
+    The union keeps `BANNED_FRAGMENTS` rather than replacing it: `"balerdis"`
+    is the maintainer's own handle, never a product's identity, and
+    `"hpl"`/`"harness"` stay valuable in a fork too -- they catch
+    upstream's own brand arriving through a transport (e.g. a cherry-picked
+    commit), which no fork's own identity would ever name.
+    """
+    derived = {identity.product_id.lower(), identity.display_name.lower(), identity.program_name.lower()}
+    derived.update(word.lower() for word in identity.wordmark_words)
+    return tuple(sorted(set(BANNED_FRAGMENTS) | derived))
+
+
+def _product_identity_offenders(
+    path: Path,
+    fragments: tuple[str, ...] | None = None,
+    package_name: str | None = None,
+) -> list[tuple[int, str]]:
+    """Every non-prose string constant in `path` that names a distribution,
+    outside `PRODUCT_IDENTITY_ALLOWLIST`.
+
+    `fragments` defaults to this engine's own vocabulary (`BANNED_FRAGMENTS`
+    plus its own `identity.json`, see `_product_identity_fragments`) so every
+    existing caller keeps scanning for exactly what it always has; a caller
+    proving the guardian tracks a *different* identity passes one in
+    explicitly instead.
+
+    `package_name` defaults to `SOURCE.name` -- the actual importable Python
+    package this scan is reading (`"hpl"` in this repository, whatever a
+    fork's own `SOURCE` points at in its copy of this file). This is
+    deliberately *not* derived from `identity.json`: `product_id`,
+    `display_name`, `program_name` and `wordmark_words` all describe the
+    *distribution's brand*, a fact a user reads, while a package's importable
+    name is a build-time fact nothing in `identity.json` promises to match --
+    a fork could rename its brand to "nova" while its package stays spelled
+    differently, or vice versa. `SOURCE.name` is the one property that is
+    *always* correct here, by construction: whoever forks this file already
+    has to repoint `SOURCE` at their own renamed package for every other rule
+    in this module to scan the right tree, and that single edit is enough to
+    keep this exemption correct too, with no second one anywhere else.
+
+    "Prose" is anything written as a bare statement -- a module, class, or
+    function docstring, or the same convention applied to a module-level or
+    class-level constant (`NAME = ...` followed by its own string literal,
+    used throughout this tree in place of a comment). Both shapes are an
+    `ast.Expr` whose value is a `Constant`; neither is ever *used* as a value,
+    which is the one thing every real offender has in common: assigned,
+    passed as an argument, or interpolated into an f-string that is raised or
+    returned. An import statement, a dotted module name, and an attribute
+    read (`hpl.__version__`) are not scanned at all -- structurally, they
+    are never `ast.Constant` string nodes in the first place.
+    """
+    if fragments is None:
+        fragments = _product_identity_fragments(_this_engine_identity())
+    if package_name is None:
+        package_name = SOURCE.name
+    source = path.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    prose = {
+        id(node.value)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Expr)
+        and isinstance(node.value, ast.Constant)
+        and isinstance(node.value.value, str)
+    }
+    # The one legitimate use of the bare literal naming the scanned package:
+    # the argument to a packaging resource lookup (`_package_files("hpl")`
+    # in `core/content.py`, or the `importlib.resources.files("hpl")`
+    # spelling it wraps) -- never a bare exact-match string anywhere else.
+    # Narrower than a blanket allowlist entry, which would also exempt the
+    # same literal used as, say, an asset name.
+    package_lookup_args = {
+        id(arg)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and (
+            (isinstance(node.func, ast.Name) and node.func.id == "_package_files")
+            or (isinstance(node.func, ast.Attribute) and node.func.attr == "files")
+        )
+        for arg in node.args
+        if isinstance(arg, ast.Constant) and arg.value == package_name
+    }
+    found = []
+    # Adjacent literal concatenation, f-strings, dict values, class attributes
+    # and `__all__` are already caught above -- each is still a single
+    # `ast.Constant`. The one shape that is not is `+`-joined string literals
+    # (`"pegas" + "us"`): each side is judged independently by the loop below
+    # unless folded into one value first, here, before the BinOp's own
+    # children are ever reached by `ast.walk` -- which visits a node before
+    # its descendants, so marking them consumed here is always in time.
+    consumed: set[int] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.BinOp) and id(node) not in consumed:
+            folded = _fold_string_concat(node)
+            if folded is not None:
+                for descendant in ast.walk(node):
+                    if descendant is not node:
+                        consumed.add(id(descendant))
+                if folded not in PRODUCT_IDENTITY_ALLOWLIST and any(
+                    name in folded.lower() for name in fragments
+                ):
+                    found.append((node.lineno, folded))
+                continue
+        if not isinstance(node, ast.Constant) or not isinstance(node.value, str) or id(node) in prose:
+            continue
+        if id(node) in consumed:
+            continue
+        if id(node) in package_lookup_args:
+            continue
+        if node.value in PRODUCT_IDENTITY_ALLOWLIST:
+            continue
+        lowered = node.value.lower()
+        if any(name in lowered for name in fragments):
+            found.append((node.lineno, node.value))
+    return sorted(found)
+
+
+class NoProductIdentityOutsideCompositionRootTest(unittest.TestCase):
+    """The engine must not know which *distribution* it is, the same way
+    `NoCliNamesOutsideAdaptersTest` already keeps it from knowing which CLI it
+    runs under. `cli.py` is the composition root and is deliberately outside
+    `agnostic_modules()` -- it is the one place identity is allowed to be a
+    literal, until `identity.parse()` reads it from data instead.
+    """
+
+    def test_agnostic_packages_are_scanned(self):
+        self.assertTrue(product_identity_modules(), "no modules found in the product-identity scan packages")
+
+    def test_no_agnostic_module_names_a_product_identity(self):
+        fragments = _product_identity_fragments(_this_engine_identity())
+        offenders = [
+            f"{path.relative_to(SOURCE)}:{number} {text!r}"
+            for path in product_identity_modules()
+            for number, text in _product_identity_offenders(path, fragments)
+        ]
+        self.assertEqual(
+            offenders,
+            [],
+            # Built from the tuple rather than spelled out, so adding a package to the scan
+            # cannot leave this message naming a set it no longer describes.
+            f"a distribution's identity leaked into {'/'.join(PRODUCT_IDENTITY_PACKAGES)}:\n"
+            + "\n".join(offenders),
+        )
+
+    def test_a_literal_product_name_is_flagged(self):
+        probe = _write_probe(self, 'name = "HPL"\n')
+        offenders = _product_identity_offenders(probe)
+        self.assertEqual([text for _, text in offenders], ["HPL"])
+
+    def test_importing_the_package_is_not_flagged(self):
+        probe = _write_probe(self, "import hpl\nfrom hpl.core import identity\n")
+        self.assertEqual(_product_identity_offenders(probe), [])
+
+    def test_reading_the_version_attribute_is_not_flagged(self):
+        probe = _write_probe(self, "import hpl\nversion = hpl.__version__\n")
+        self.assertEqual(_product_identity_offenders(probe), [])
+
+    def test_a_docstring_mentioning_the_product_is_not_flagged(self):
+        probe = _write_probe(self, '"""HPL itself, mentioned in prose only."""\nx = 1\n')
+        self.assertEqual(_product_identity_offenders(probe), [])
+
+    def test_an_attribute_doc_string_mentioning_the_product_is_not_flagged(self):
+        """The same convention `TEMPORARY_PREFIX`/`ALLOWED_CHARACTERS` use
+        throughout this tree: a bare string statement documenting the constant
+        above it, never assigned to anything, never a docstring by ast's own
+        definition of the term."""
+        probe = _write_probe(self, 'NAME = "x"\n"""HPL reads this constant."""\n')
+        self.assertEqual(_product_identity_offenders(probe), [])
+
+    def test_an_allowlisted_wire_literal_is_not_flagged(self):
+        probe = _write_probe(self, 'SCHEMA = "hpl/artifact-catalog/v4"\n')
+        self.assertEqual(_product_identity_offenders(probe), [])
+
+    def test_bare_hpl_as_a_package_files_argument_is_not_flagged(self):
+        """The one legitimate use of the bare literal `"hpl"`: a packaging
+        resource lookup, e.g. `_package_files("hpl")` in `core/content.py`."""
+        probe = _write_probe(self, 'root = _package_files("hpl")\n')
+        self.assertEqual(_product_identity_offenders(probe), [])
+
+    def test_bare_hpl_as_an_importlib_resources_files_argument_is_not_flagged(self):
+        probe = _write_probe(self, 'root = importlib.resources.files("hpl")\n')
+        self.assertEqual(_product_identity_offenders(probe), [])
+
+    def test_string_concatenation_of_a_product_identity_is_flagged(self):
+        """`"h" + "pl"` names the same distribution `"hpl"` does, split
+        across an `ast.BinOp` string `+` so that neither individual `ast.Constant`
+        matches on its own. Adjacent literal concatenation, f-strings, dict
+        values, class attributes and `__all__` are already caught because each
+        is still a single `ast.Constant`; only `+`-joined literals fold two
+        constants into one at runtime without ever being one `ast.Constant` node
+        -- this is the one shape the offender scan must fold before matching."""
+        probe = _write_probe(self, 'asset = "h" + "pl"\n')
+        self.assertEqual([text for _, text in _product_identity_offenders(probe)], ["hpl"])
+
+    def test_bare_hpl_elsewhere_is_flagged(self):
+        """Outside a package-resource lookup, the bare literal `"hpl"` is a
+        real offender -- this is the narrowing that must catch `core/upgrade.py`'s
+        `asset="hpl"`, no longer blanket-exempted."""
+        probe = _write_probe(self, 'asset = "hpl"\n')
+        self.assertEqual([text for _, text in _product_identity_offenders(probe)], ["hpl"])
+
+    def test_the_watched_fragments_change_with_the_identity_they_are_derived_from(self):
+        """Regression for the defect a fork of this engine exposed:
+        `BANNED_FRAGMENTS` used to be the guardian's entire vocabulary, typed
+        by hand, and it happens to spell HPL's own brand -- true for this
+        repository only by coincidence. `ACME_IDENTITY` (from
+        `test_cli_identity_sweep`, the suite's existing fictional identity,
+        also used by `test_cli.py::DistributionVersionFlagTest`) names a
+        product this repository is not; if the fragments this guardian
+        watches for were still a hand-typed literal, feeding it a different
+        identity would change nothing. They must change.
+        """
+        acme_fragments = _product_identity_fragments(ACME_IDENTITY)
+        engine_fragments = _product_identity_fragments(_this_engine_identity())
+        self.assertIn("acme", acme_fragments)
+        self.assertNotIn("acme", engine_fragments)
+        # BANNED_FRAGMENTS survives the union regardless of which identity is
+        # fed in -- "balerdis" names the maintainer, not a product, and
+        # "hpl"/"harness" stay valuable in a fork as upstream's own brand.
+        self.assertTrue(set(BANNED_FRAGMENTS).issubset(acme_fragments))
+
+    def test_a_forks_own_brand_literal_is_flagged_once_its_identity_is_fed_in(self):
+        """The measurement that motivated this fix: with `ACME_IDENTITY`'s own
+        fragments, a literal naming ACME's brand is caught -- proof that the
+        hole the fork found (a distribution whose brand is not "hpl" goes
+        unwatched) is closed. Regressing `_product_identity_fragments` back to
+        returning `BANNED_FRAGMENTS` unchanged makes this fail again."""
+        probe = _write_probe(self, 'name = "Acme"\n')
+        offenders = _product_identity_offenders(probe, fragments=_product_identity_fragments(ACME_IDENTITY))
+        self.assertEqual([text for _, text in offenders], ["Acme"])
+
+    def test_the_package_lookup_exemption_tracks_the_scanned_packages_own_name(self):
+        """Regression for the second half of the same defect: the
+        `_package_files(...)`/`importlib.resources.files(...)` exemption used
+        to compare its argument against the hand-typed literal `"hpl"` --
+        correct for this repository only because its own Python package
+        happens to be spelled that way. This engine ships as a full fork with
+        its own package renamed (not merely its brand), and a forked
+        `core/content.py` calls `_package_files("<its own package name>")` for
+        exactly the same legitimate reason this repository calls
+        `_package_files("hpl")`. Once that fork's own name is a watched
+        fragment (which `_product_identity_fragments` now makes it, see the
+        fix above), a still-hardcoded `"hpl"` comparison here would flag
+        that legitimate call as an offender -- breaking the fork's suite the
+        moment this fix's other half was transported into it.
+        """
+        probe = _write_probe(self, 'root = _package_files("nova")\n')
+        offenders = _product_identity_offenders(probe, fragments=("nova",), package_name="nova")
+        self.assertEqual(offenders, [])
+
+    def test_the_package_lookup_exemption_does_not_blanket_exempt_every_package_name(self):
+        """The exemption is scoped to the package actually being scanned, not
+        to every string that shows up as a `_package_files(...)` argument --
+        this is what proves the fix reads `package_name`, not just widens the
+        exemption to always pass."""
+        probe = _write_probe(self, 'root = _package_files("nova")\n')
+        offenders = _product_identity_offenders(probe, fragments=("nova",), package_name="hpl")
+        self.assertEqual([text for _, text in offenders], ["nova"])
+
+
+def bundled_ts_assets() -> list[Path]:
+    """Every TypeScript/JavaScript asset an adapter bundles and ships verbatim.
+
+    `product_identity_modules()` above only walks `*.py` (it calls `ast.parse`
+    on what it finds), so a `.ts` asset is invisible to every brand scan in this
+    file -- exactly why the literal `hpl-orchestrator` in
+    `hpl-orchestrator-notifier.ts` shipped for a release without any test
+    noticing. This is the narrow mirror for that specific gap.
+    """
+    return sorted(
+        path
+        for path in (SOURCE / "adapters").rglob("*.ts")
+        if "__pycache__" not in path.parts
+    )
+
+
+class NoAgentNameLiteralInBundledTsAssetsTest(unittest.TestCase):
+    """Regression for the defect that shipped: a bundled `.ts` plugin hardcoded
+    the orchestrator agent's name as a literal, so the comparison it drove
+    silently never matched once a distribution's own content named its
+    orchestrator something else.
+
+    This does not (and must not) forbid the substring "hpl" in a bundled
+    asset outright -- a distribution's own `program_name` may legitimately be
+    "hpl", and every artifact/contract name this engine's skill-registry
+    plugins build is filled in from `{{program_name}}`/`{{display_name}}` at
+    install time, never hardcoded in the source asset any more. It forbids one
+    specific, derived thing: the orchestrator's name *as it would actually be
+    rendered* -- `content.SESSION_STARTS_IN`, the one source of truth
+    `catalog._orchestrator_name` reads -- appearing as a quoted source literal
+    in any bundled `.ts` asset. Only a hardcoded copy of that exact name can
+    trigger this; the placeholder `{{orchestrator}}` this defect's fix
+    introduced does not, because it is not the rendered name, only the request
+    for it.
+
+    Proven against the pre-fix asset: reverting `orchestrator-notifier.ts` to
+    `const ORCHESTRATOR_AGENT = "hpl-orchestrator"` makes this test fail
+    again.
+    """
+
+    def test_bundled_ts_assets_exist(self):
+        self.assertTrue(bundled_ts_assets(), "no .ts assets found under adapters/ -- scan target drifted")
+
+    def test_no_bundled_ts_asset_hardcodes_the_rendered_orchestrator_name(self):
+        from hpl.core import content as content_module
+
+        literal = f'"{content_module.SESSION_STARTS_IN}"'
+        offenders = [
+            str(path.relative_to(SOURCE))
+            for path in bundled_ts_assets()
+            if literal in path.read_text(encoding="utf-8")
+        ]
+        self.assertEqual(
+            offenders,
+            [],
+            f"a bundled .ts asset hardcodes the orchestrator name {literal} instead of "
+            "asking for it through {{orchestrator}}:\n" + "\n".join(offenders),
+        )
+
+
+def bundled_runtime_assets() -> list[Path]:
+    """Every TypeScript/JavaScript asset an adapter bundles and ships verbatim.
+
+    Wider than `bundled_ts_assets()` above on purpose: a distribution's
+    rebranding substitutes `.md` and `.txt` only, so the body of any runtime
+    asset -- `.ts` or `.js` alike -- travels to every distribution exactly as
+    written here. The filename is derived from the installed identity; the text
+    inside it is not.
+    """
+    return sorted(
+        path
+        for path in (SOURCE / "adapters").rglob("*")
+        if path.suffix in {".ts", ".js"} and "__pycache__" not in path.parts
+    )
+
+
+#: The bundled runtime assets allowed to carry a brand fragment, each because
+#: what it carries is wire plumbing rather than a name shown to anyone.
+#:
+#: Keyed by the file's full path relative to `SOURCE`, never by bare
+#: filename. `bundled_runtime_assets()` scans every `.ts`/`.js` anywhere
+#: under `adapters/` -- not just under one adapter's `assets/` tree -- so a
+#: basename-only exemption would clear *any* `.ts`/`.js` sharing one of these
+#: two names, dropped into *any* adapter, at *any* depth, without that file
+#: having earned the exemption on its own merits. The full path is the one
+#: spelling that names the exact file this exemption was written for, and no
+#: other:
+#:
+#: - `adapters/opencode/assets/plugins/skill-registry.ts` reads the env var
+#:   names `HPL_SKILL_REGISTRY_BIN` and `HPL_SKILL_ROOTS`, the
+#:   contract it shares with the installer. Both sides must spell them the
+#:   same way in every distribution, exactly like the wire-format identifiers
+#:   `NoProductIdentityOutsideCompositionRootTest` exempts on the Python side.
+#: - `adapters/opencode/assets/plugins/zellij-state.ts` addresses a state
+#:   directory whose engine-branded name is shared with tooling outside this
+#:   repository; the asset says so itself.
+#: - `adapters/opencode/assets/plugins/secret-transport.ts` reads and
+#:   writes the env var name `HPL_SECRET_<NAME>` -- the same wire-format
+#:   treatment as `HPL_SKILL_REGISTRY_BIN` above, a name the model itself
+#:   sees and a shell expands, identical across every distribution.
+#:
+#: Listed here, and nowhere else, so that adding a new asset can never quietly
+#: join them: a `.ts` that ships a brand fragment without appearing here, at
+#: this exact path, fails.
+BRAND_EXEMPT_RUNTIME_ASSETS = frozenset(
+    {
+        "adapters/opencode/assets/plugins/skill-registry.ts",
+        "adapters/opencode/assets/plugins/zellij-state.ts",
+        "adapters/opencode/assets/plugins/secret-transport.ts",
+    }
+)
+
+
+class NoBrandFragmentInBundledRuntimeAssetsTest(unittest.TestCase):
+    """A distribution that is not this one must not ship an asset that says so.
+
+    The `.ts`/`.js` assets are the one shipped body no rebranding rewrites, so a
+    brand fragment written into one travels verbatim into every distribution
+    built on this engine -- a plugin introducing itself under the wrong product
+    name to a person who never installed this one.
+
+    Written as one scan over every bundled runtime asset rather than as a check
+    on the newest one: a per-file guard is the enumerated mirror this project
+    keeps out, and it would protect only the asset whose author remembered to
+    add it.
+    """
+
+    def test_there_are_bundled_runtime_assets_to_scan(self):
+        self.assertTrue(bundled_runtime_assets(), "no .ts/.js assets found; this test would prove nothing")
+
+    def test_no_bundled_runtime_asset_carries_a_brand_fragment(self):
+        offenders = {}
+        for path in bundled_runtime_assets():
+            relative = str(path.relative_to(SOURCE))
+            if relative in BRAND_EXEMPT_RUNTIME_ASSETS:
+                continue
+            try:
+                lowered = path.read_text(encoding="utf-8").lower()
+            except UnicodeDecodeError as error:
+                print(
+                    f"NoBrandFragmentInBundledRuntimeAssetsTest: skipped {path} -- not "
+                    f"decodable as UTF-8 text ({error}); a binary asset cannot carry a brand "
+                    "fragment in a form this scan can read.",
+                    file=sys.stderr,
+                )
+                continue
+            found = sorted(fragment for fragment in BANNED_FRAGMENTS if fragment in lowered)
+            if found:
+                offenders[relative] = found
+        self.assertEqual(
+            offenders,
+            {},
+            "a bundled runtime asset names a distribution's brand; its text ships verbatim "
+            "to every distribution, so say 'this product', 'the installer' or 'the runtime' "
+            f"instead: {offenders}",
+        )
+
+    def test_every_exemption_still_names_an_asset_that_exists(self):
+        """Each entry in `BRAND_EXEMPT_RUNTIME_ASSETS` must name one exact file,
+        at that exact path, that `bundled_runtime_assets()` actually finds
+        today -- not merely a filename that happens to appear *somewhere*
+        under `adapters/`. A basename-only check here is exactly what would
+        let a brand-new `.ts` in an unrelated adapter subdirectory ride in on
+        this exemption for free; comparing full relative paths closes that
+        gap."""
+        paths = {str(path.relative_to(SOURCE)) for path in bundled_runtime_assets()}
+        self.assertTrue(paths, "no .ts/.js assets found; this test would prove nothing")
+        self.assertEqual(
+            sorted(BRAND_EXEMPT_RUNTIME_ASSETS - paths),
+            [],
+            "an exemption outlived the asset it was written for, or was never spelled as the "
+            "exact path of a real file -- remove it",
+        )
+
+
+def verbatim_adapter_assets() -> list[Path]:
+    """Every file an adapter bundles under its own `assets/` tree whose body
+    ships unchanged into every distribution built on this engine.
+
+    Rebranding a distribution substitutes text in `.md` and `.txt` files only
+    -- this repository's own product-identity rule. The body of anything else
+    an adapter bundles under `assets/` -- `.py`, `.ts`, `.js`, `.json`, or any
+    other file added later -- travels verbatim, so a brand fragment written
+    into one of those ships, unrebranded, into every distribution. Wider than
+    `bundled_runtime_assets()` above (which only ever looked at `.ts`/`.js`
+    anywhere under `adapters/`): derived from the tree itself, by suffix
+    exclusion rather than an enumerated allowlist of extensions, so a new
+    asset group or a new file type joins the scan without anyone remembering
+    to widen it -- and scoped to `assets/` specifically, since that is the
+    one subtree an adapter ships of its own that installs onto a user's
+    machine; `render.py`, `layout.py` and the rest of an adapter's own source
+    are HPL's engine code, not a bundled asset, and are covered by
+    `NoProductIdentityOutsideCompositionRootTest` instead.
+    """
+    return sorted(
+        path
+        for assets_root in ADAPTERS.glob("*/assets")
+        for path in assets_root.rglob("*")
+        if path.is_file()
+        and path.suffix not in {".md", ".txt"}
+        and "__pycache__" not in path.parts
+    )
+
+
+def _engine_brand_fragments() -> tuple[str, ...]:
+    """The brand fragments this engine's own `identity.json` actually names,
+    lower-cased, read through `identity.parse()` rather than copied as a
+    literal -- so renaming this engine's own brand keeps this guardian valid
+    without a second edit anywhere in the test suite.
+
+    Deliberately narrower than `brand_fragments.BANNED_FRAGMENTS`, which also
+    bans `"harness"` and the maintainer's own GitHub handle `"balerdis"` for a
+    wider, unrelated concern (nothing a generated installer or journal may
+    ever say). This derives only `program_name` and `display_name` -- the two
+    fields `_asset_facts` in `adapters/opencode/adapter.py` actually threads
+    into a bundled asset as placeholders -- because those two are exactly
+    what "names the engine brand in a verbatim asset body" means here.
+    """
+    from hpl.core import identity as identity_module
+
+    identity = identity_module.parse((SOURCE / "identity.json").read_bytes())
+    return tuple(sorted({identity.program_name.lower(), identity.display_name.lower()}))
+
+
+def _brand_offenders(path: Path, fragments: tuple[str, ...]) -> list[str]:
+    """Every brand fragment appearing as literal text in `path`.
+
+    A plain case-insensitive substring search, deliberately: none of the
+    placeholders a bundled asset may use (`{{program_name}}`,
+    `{{display_name}}`, `{{program_module_name}}`, `{{program_pascal_name}}`,
+    `{{program_npm_name}}`, `{{orchestrator}}` -- see `core.placeholders`)
+    contains a derived brand fragment as a substring of its own spelling, so a
+    file that only ever asks for the placeholder never matches here; only a
+    hardcoded copy of the brand itself does.
+
+    `verbatim_adapter_assets()` finds every file under `assets/` by suffix
+    exclusion, not by an allowlist of text-shaped extensions -- so the day a
+    binary (an icon, a font) lands under `assets/`, it reaches here too. A
+    binary cannot carry a brand fragment in a form this scan can read, so
+    skipping it is correct; skipping it *silently* is not -- that silent skip
+    is exactly the defect this engine's own leak scanner once carried, where
+    an undecodable file vanished from the scan with nothing to show for it.
+    So a decode failure is reported to stderr (visible in the suite's own
+    output) and treated as "found nothing", never as a raised exception that
+    would take the whole suite down for a reason unrelated to what this test
+    watches.
+    """
+    try:
+        lowered = path.read_text(encoding="utf-8").lower()
+    except UnicodeDecodeError as error:
+        print(
+            f"NoEngineBrandInVerbatimAssetBodiesTest: skipped {path} -- not decodable as "
+            f"UTF-8 text ({error}); a binary asset cannot carry a brand fragment in a form "
+            "this scan can read.",
+            file=sys.stderr,
+        )
+        return []
+    return sorted(fragment for fragment in fragments if fragment in lowered)
+
+
+#: Verbatim `assets/` files allowed to carry an engine brand fragment, each
+#: because what it carries is wire plumbing -- an identifier shared with
+#: something outside this repository, or with a running plugin's own
+#: environment contract -- rather than a name shown to anyone.
+#:
+#: Keyed by the file's full path relative to `SOURCE` (e.g.
+#: `"adapters/opencode/assets/plugins/skill-registry.ts"`), never by bare
+#: filename. A basename-only exemption would clear *any* file sharing that
+#: name in *any* adapter's `assets/` tree, at any depth -- a brand-new file
+#: called `assets.json` dropped into an unrelated subdirectory would ride in
+#: on this list for free, having earned nothing. The full path is the one
+#: spelling that names the exact file this exemption was written for, and no
+#: other:
+#:
+#: - `adapters/opencode/assets/plugins/skill-registry.ts` reads the env var
+#:   names `HPL_SKILL_REGISTRY_BIN` and `HPL_SKILL_ROOTS`: a contract
+#:   it shares with `adapter.py::_skill_registry_contract`, which must spell
+#:   them identically in every distribution -- the same wire-plumbing
+#:   treatment `PRODUCT_IDENTITY_ALLOWLIST` already gives those two names on
+#:   the Python side.
+#: - `adapters/opencode/assets/plugins/zellij-state.ts` addresses a state
+#:   directory (`hpl-zellij-state`) whose engine-branded name is shared
+#:   with tooling outside this repository; the asset says so itself, in the
+#:   comment `NoBrandFragmentInBundledRuntimeAssetsTest` already exempts it
+#:   for.
+#: - `adapters/opencode/assets/registry/assets.json`'s
+#:   `"schema": "hpl-registry-assets/v3"` is a versioned schema
+#:   identifier, of the same family as the `SCHEMA` constants in
+#:   `core/journal.py` and `core/catalog.py`, stable by definition across
+#:   every distribution built on the same engine; the distribution declares
+#:   it in its own protected tokens, and deriving it from `identity.json`
+#:   would make it diverge between distributions without anyone reading it.
+#: - `adapters/opencode/assets/plugins/secret-transport.ts` reads and
+#:   writes the wire-format variable name `HPL_SECRET_<NAME>` -- the same
+#:   treatment `HPL_SKILL_REGISTRY_BIN`/`HPL_SKILL_ROOTS` already get
+#:   above: a name the model itself sees and a shell expands, shared across
+#:   every distribution built on this engine, never rebranded per
+#:   distribution the way a shown name would be.
+#: - `adapters/claudecode/assets/engram-hook.py` builds the same
+#:   `$HPL_SECRET_<NAME>` token when it redacts a prompt before engram
+#:   stores it, the one wire-format name the OpenCode plugin above shares.
+#:
+#: Listed here, and nowhere else, so a new asset can never quietly join them:
+#: one that ships a brand fragment without appearing here, at this exact
+#: path, fails the scan.
+VERBATIM_ASSET_BRAND_EXEMPTIONS = frozenset(
+    {
+        "adapters/opencode/assets/plugins/skill-registry.ts",
+        "adapters/opencode/assets/plugins/zellij-state.ts",
+        "adapters/opencode/assets/registry/assets.json",
+        "adapters/opencode/assets/plugins/secret-transport.ts",
+        "adapters/claudecode/assets/engram-hook.py",
+    }
+)
+
+
+class NoEngineBrandInVerbatimAssetBodiesTest(unittest.TestCase):
+    """A residue this engine carried for five releases as an accepted defect,
+    never a fixed one: `skill_registry.py` said "HPL skill index" in its
+    module docstring, and because that file ships verbatim -- no rebrand step
+    ever rewrites a `.py` body -- the literal reached every distribution
+    built on this engine, including one that is not called HPL at all.
+    Nothing on the engine side watched for it; only a downstream
+    distribution saw the symptom.
+
+    This is that watcher, on the engine side, where the fix belongs. It does
+    not forbid an asset from naming the running product -- `{{program_name}}`
+    and its siblings from `core.placeholders` are exactly the correct way to
+    do that -- only a hardcoded copy of the brand as this engine's own
+    `identity.json` literally spells it, appearing as ordinary text in a file
+    whose body no rebrand step ever rewrites.
+    """
+
+    def test_there_are_verbatim_assets_to_scan(self):
+        self.assertTrue(
+            verbatim_adapter_assets(),
+            "no non-.md/.txt files found under adapters/*/assets/ -- scan target drifted",
+        )
+
+    def test_no_verbatim_asset_names_the_engine_brand(self):
+        fragments = _engine_brand_fragments()
+        offenders = {
+            str(path.relative_to(SOURCE)): found
+            for path in verbatim_adapter_assets()
+            if str(path.relative_to(SOURCE)) not in VERBATIM_ASSET_BRAND_EXEMPTIONS
+            for found in [_brand_offenders(path, fragments)]
+            if found
+        }
+        self.assertEqual(
+            offenders,
+            {},
+            "a verbatim asset names the engine brand; its body ships unchanged into every "
+            "distribution built on this engine -- use a neutral description, or fill in "
+            "{{program_name}}/{{display_name}}/{{program_module_name}}/{{program_pascal_name}}/"
+            f"{{program_npm_name}}/{{orchestrator}} instead: {offenders}",
+        )
+
+    def test_every_exemption_still_names_an_asset_that_exists(self):
+        """Each entry in `VERBATIM_ASSET_BRAND_EXEMPTIONS` must name one exact
+        file, at that exact path, that `verbatim_adapter_assets()` actually
+        finds today -- not merely a filename that happens to appear
+        *somewhere* under `adapters/*/assets/`. A basename-only check here
+        is exactly what let a brand-new `assets.json` in an unrelated
+        subdirectory ride in on this exemption for free; comparing full
+        relative paths closes that gap."""
+        paths = {str(path.relative_to(SOURCE)) for path in verbatim_adapter_assets()}
+        self.assertTrue(paths, "no verbatim assets found; this test would prove nothing")
+        self.assertEqual(
+            sorted(VERBATIM_ASSET_BRAND_EXEMPTIONS - paths),
+            [],
+            "an exemption outlived the asset it was written for, or was never spelled as the "
+            "exact path of a real file -- remove it",
+        )
+
+    def test_a_literal_brand_fragment_is_flagged(self):
+        fragments = _engine_brand_fragments()
+        probe = _write_probe(self, '"""Build the portable HPL skill index."""\n')
+        self.assertEqual(_brand_offenders(probe, fragments), ["hpl"])
+
+    def test_a_placeholder_use_is_not_flagged(self):
+        fragments = _engine_brand_fragments()
+        probe = _write_probe(self, '"""Build the portable {{program_name}} skill index."""\n')
+        self.assertEqual(_brand_offenders(probe, fragments), [])
+
+
+def _owning_adapter(path: Path) -> str:
+    """The adapter a file belongs to, or empty for the composition root itself."""
+    relative = path.relative_to(ADAPTERS).parts
+    return relative[0] if len(relative) > 1 else ""
+
+
+#: The documented flow is `tui -> cli -> {core, infra, ports, adapters}`, with `core/`
+#: allowed to see only itself and `ports/` -- the one rule the whole hexagonal split exists
+#: to keep true, because an engine that can import `infra/`, an adapter, or `cli.py` is an
+#: engine that has stopped being ignorant of the runtime around it. Every other entry below
+#: was not invented; it was read off the tree with `grep` before this rule was written, so
+#: the rule matches what the code already does rather than a stricter shape someone wished
+#: it did:
+#:
+#: - `ports/` imports `core` (for the types a port's signature is built from) and itself;
+#:   never `infra/` or an adapter, or a port would stop being an interface a driven adapter
+#:   is free to implement however it likes.
+#: - `infra/` imports `core` and `ports` -- an adapter to a port implemented in terms of the
+#:   core types it moves -- plus itself (`snapshot_store_file.py` reuses a constant from
+#:   `journal_store_file.py`). Never `adapters/`, `tui/`, or `cli.py`.
+#: - `adapters/` (the CLI adapters, e.g. `adapters/opencode/`) imports `core` and itself
+#:   only. It satisfies the `CliAdapter` protocol structurally -- Python's `Protocol` needs
+#:   no import from the implementer -- so it has never needed `ports/`, and this rule does
+#:   not grant an allowance nothing exercises.
+#: - `tui/` imports `core`, `adapters` (`tui/session.py` calls `hpl.adapters.available()`
+#:   directly to build the registry a session runs against) and, as the one named exemption
+#:   below, `cli`.
+#: - `cli.py` imports `core`, `ports`, `infra`, `adapters` and, as the same named exemption,
+#:   `tui`.
+#:
+#: The exemption: this is not a strict DAG between `cli` and `tui`. `cli.py` imports
+#: `hpl.tui.app` and calls `tui_app.main()` as the interactive entry point -- the
+#: installer always finishes in the TUI, never in a bare CLI prompt, which is the whole
+#: point of the "instalador abre siempre la TUI" change this rule arrived after. `tui/app.py`
+#: and `tui/session.py` import back into `cli` to reuse its argument parsing and execution
+#: rather than duplicating it. Two modules calling into each other is not layering, so this
+#: is named here rather than left implicit, and `test_the_only_named_exemption_is_the_cli_tui_entry_point`
+#: below fails the moment either side's allowance grows past exactly this pair.
+LAYER_ALLOWED_IMPORTS: dict[str, frozenset[str]] = {
+    "core": frozenset({"core", "ports"}),
+    "ports": frozenset({"ports", "core"}),
+    "infra": frozenset({"infra", "core", "ports"}),
+    "adapters": frozenset({"adapters", "core"}),
+    "tui": frozenset({"tui", "core", "adapters", "cli"}),
+    "cli": frozenset({"cli", "core", "ports", "infra", "adapters", "tui"}),
+}
+
+
+def _layer_of_path(path: Path, source: Path) -> str | None:
+    """Which policed layer `path` belongs to, or `None` for a module this rule does not
+    police (the package root `__init__.py`/`__main__.py`, or `content/`, neither of which
+    is part of the `tui -> cli -> {core, infra, ports, adapters}` direction this rule
+    enforces)."""
+    relative = path.relative_to(source).parts
+    if relative == ("cli.py",):
+        return "cli"
+    head = relative[0]
+    return head if head in LAYER_ALLOWED_IMPORTS else None
+
+
+def _module_dotted_name(path: Path, source: Path) -> str:
+    """The dotted module name Python itself would give `path`, e.g.
+    `hpl/core/catalog.py` -> `hpl.core.catalog`, and a package's own `__init__.py`
+    -> the package name with no trailing `.__init__`. Relative-import resolution below needs
+    this to find the package a level climbs from."""
+    relative = path.relative_to(source.parent).with_suffix("")
+    parts = list(relative.parts)
+    if parts[-1] == "__init__":
+        parts = parts[:-1]
+    return ".".join(parts)
+
+
+def _resolve_import_from(path: Path, node: ast.ImportFrom, source: Path) -> str:
+    """The absolute dotted module `node` names, resolving `node.level` the way Python's own
+    import machinery does. `level == 0` (`from hpl.infra import x`) is already absolute.
+    A relative import climbs from the package *containing* `path` -- itself, if `path` is a
+    package's own `__init__.py`, otherwise its parent -- one extra level per point beyond the
+    first, exactly as `from . import x` inside a module means "this package" while
+    `from .. import x` means "the package above it". Skipping this and treating every
+    `ImportFrom` as already absolute is the gap named in the brief: a relative import that
+    crosses a forbidden boundary would silently resolve to nothing and never be judged, which
+    is exactly what `test_a_relative_import_crossing_the_boundary_is_caught` below exists to
+    catch.
+    """
+    if node.level == 0:
+        return node.module or ""
+    package_parts = _module_dotted_name(path, source).split(".")
+    if path.name != "__init__.py":
+        package_parts = package_parts[:-1]
+    if node.level > 1:
+        package_parts = package_parts[: len(package_parts) - (node.level - 1)]
+    if node.module:
+        package_parts = package_parts + node.module.split(".")
+    return ".".join(package_parts)
+
+
+def _layer_of_module(dotted: str, root_package: str) -> str | None:
+    """Which policed layer an absolute dotted module name (e.g. `hpl.infra.fs_posix`)
+    lives in, or `None` for a bare `import hpl` (carries no layer -- `hpl/__init__.py`
+    is a version constant, not a dependency) or a name outside `root_package` entirely (a
+    third-party or stdlib import, which this rule has no opinion about)."""
+    if dotted == root_package:
+        return None
+    prefix = root_package + "."
+    if not dotted.startswith(prefix):
+        return None
+    head = dotted[len(prefix):].split(".", 1)[0]
+    return head if head in LAYER_ALLOWED_IMPORTS else None
+
+
+def _all_modules(source: Path) -> list[Path]:
+    return sorted(path for path in source.rglob("*.py") if "__pycache__" not in path.parts)
+
+
+def _modules_by_layer(source: Path) -> dict[str, list[Path]]:
+    layered: dict[str, list[Path]] = {name: [] for name in LAYER_ALLOWED_IMPORTS}
+    for path in _all_modules(source):
+        layer = _layer_of_path(path, source)
+        if layer is not None:
+            layered[layer].append(path)
+    return layered
+
+
+def _import_direction_violations(source: Path) -> list[str]:
+    """Every import, anywhere under `source`, whose target layer is not in the importing
+    module's own `LAYER_ALLOWED_IMPORTS` entry -- the one scan this whole rule exists to
+    run."""
+    root_package = source.name
+    offenders: list[str] = []
+    for path in _all_modules(source):
+        layer = _layer_of_path(path, source)
+        if layer is None:
+            continue
+        allowed = LAYER_ALLOWED_IMPORTS[layer]
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    target = _layer_of_module(alias.name, root_package)
+                    if target is not None and target not in allowed:
+                        offenders.append(
+                            f"{path.relative_to(source)}:{node.lineno} {layer}/ imports "
+                            f"{target}/ via 'import {alias.name}'"
+                        )
+            elif isinstance(node, ast.ImportFrom):
+                resolved = _resolve_import_from(path, node, source)
+                target = _layer_of_module(resolved, root_package)
+                if target is not None and target not in allowed:
+                    spelled = "from " + "." * node.level + (node.module or "") + " import ..."
+                    offenders.append(
+                        f"{path.relative_to(source)}:{node.lineno} {layer}/ imports "
+                        f"{target}/ via {spelled!r}"
+                    )
+    return sorted(offenders)
+
+
+def _write_scratch_hpl(test: unittest.TestCase, files: dict[str, str]) -> Path:
+    """A throwaway `hpl/` tree under a temp directory, holding only the files a
+    self-test needs. Named `hpl` (not the real package's name by coincidence, but
+    because `_layer_of_module` keys off `source.name`) so the same resolution code this
+    rule runs against `src/hpl` also runs, unmodified, against a tree small enough to
+    hold one deliberate violation."""
+    directory = tempfile.TemporaryDirectory()
+    test.addCleanup(directory.cleanup)
+    root = Path(directory.name) / "hpl"
+    for relative_path, content in files.items():
+        full_path = root / relative_path
+        full_path.parent.mkdir(parents=True, exist_ok=True)
+        full_path.write_text(content, encoding="utf-8")
+    return root
+
+
+class ImportDirectionTest(unittest.TestCase):
+    """The rule `NoCliNamesOutsideAdaptersTest` and `AdapterIsolationTest` both assume but
+    never check: that dependencies only ever point the one documented way,
+    `tui -> cli -> {core, infra, ports, adapters}`, with `core/` importing only `core` and
+    `ports`. Everything else those two tests catch is a *symptom* of an engine that already
+    knows too much; this is the rule that keeps the cause from happening at all. `core/`
+    importing `infra/` would not mention a CLI by name and would slip straight past
+    `NoCliNamesOutsideAdaptersTest`, yet it is the more fundamental break: the engine would
+    now depend on a runtime -- a filesystem, a subprocess, an HTTP client -- it exists
+    specifically to stay ignorant of, and every one of `core/`'s claims to be provable by a
+    table of canned answers (see `NoClockReadsInDeterministicModulesTest`) would stop being
+    true the moment that import could reach an adapter's side effects.
+
+    The allowed table is `LAYER_ALLOWED_IMPORTS` above, together with the one named
+    exemption in its own comment. It was read off the tree, not designed in the abstract:
+    at the time this test was written, the real `src/hpl` tree already obeyed it in
+    full.
+    """
+
+    def test_every_policed_layer_has_modules_to_scan(self):
+        """Without this, a typo in `LAYER_ALLOWED_IMPORTS` or `_layer_of_path` that made a
+        layer scan nothing would leave `test_no_import_crosses_a_forbidden_layer_boundary`
+        passing vacuously, the same failure mode `test_agnostic_packages_are_scanned` and
+        `test_deterministic_packages_are_scanned` already guard elsewhere in this file."""
+        layered = _modules_by_layer(SOURCE)
+        for layer in LAYER_ALLOWED_IMPORTS:
+            self.assertTrue(layered[layer], f"no modules found under {layer}/ -- this rule would pass vacuously")
+
+    def test_no_import_crosses_a_forbidden_layer_boundary(self):
+        offenders = _import_direction_violations(SOURCE)
+        self.assertEqual(
+            offenders,
+            [],
+            "an import crossed a forbidden hexagonal-layer boundary:\n" + "\n".join(offenders),
+        )
+
+    def test_the_only_named_exemption_is_the_cli_tui_entry_point(self):
+        """Guards the one exemption this rule grants the way `test_app_py_is_not_scanned_at_all`
+        guards the clock-read rule's exemption: if either side of the `cli`/`tui` pair grows a
+        new allowance beyond exactly its partner, this fails and forces whoever widened it to
+        say why in writing, here, rather than let the direction rule quietly get looser."""
+        self.assertEqual(LAYER_ALLOWED_IMPORTS["cli"] - {"cli", "core", "ports", "infra", "adapters"}, {"tui"})
+        self.assertEqual(LAYER_ALLOWED_IMPORTS["tui"] - {"tui", "core", "adapters"}, {"cli"})
+
+    def test_core_importing_infra_is_caught(self):
+        root = _write_scratch_hpl(self, {"core/probe.py": "from hpl.infra import fs_posix\n"})
+        offenders = _import_direction_violations(root)
+        self.assertEqual(
+            offenders,
+            ["core/probe.py:1 core/ imports infra/ via 'from hpl.infra import ...'"],
+        )
+
+    def test_core_importing_an_adapter_is_caught(self):
+        root = _write_scratch_hpl(self, {"core/probe.py": "import hpl.adapters.opencode\n"})
+        offenders = _import_direction_violations(root)
+        self.assertEqual(
+            offenders,
+            ["core/probe.py:1 core/ imports adapters/ via 'import hpl.adapters.opencode'"],
+        )
+
+    def test_core_importing_cli_is_caught(self):
+        root = _write_scratch_hpl(self, {"core/probe.py": "from hpl.cli import main\n"})
+        offenders = _import_direction_violations(root)
+        self.assertEqual(
+            offenders,
+            ["core/probe.py:1 core/ imports cli/ via 'from hpl.cli import ...'"],
+        )
+
+    def test_a_relative_import_crossing_the_boundary_is_caught(self):
+        """The case named in the brief: `from ..infra import ...` never spells `hpl.infra`
+        anywhere in the source text, so a resolver that judged the raw `node.module` string
+        instead of resolving `node.level` first would let this straight through."""
+        root = _write_scratch_hpl(self, {"core/probe.py": "from ..infra import fs_posix\n"})
+        offenders = _import_direction_violations(root)
+        self.assertEqual(
+            offenders,
+            ["core/probe.py:1 core/ imports infra/ via 'from ..infra import ...'"],
+        )
+
+    def test_a_permitted_import_is_not_flagged(self):
+        """The rule must stay quiet on exactly what the real tree already does, or it is too
+        strict to ship: `infra/` reusing a constant from a sibling `infra/` module, and
+        `core/` importing `ports/`."""
+        root = _write_scratch_hpl(
+            self,
+            {
+                "infra/probe.py": "from hpl.infra import journal_store_file\n",
+                "core/probe.py": "from hpl.ports import filesystem\n",
+            },
+        )
+        self.assertEqual(_import_direction_violations(root), [])
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,0 +1,700 @@
+"""Fetching, verifying and placing a `download`- or `npm`-distributed MCP server."""
+from __future__ import annotations
+
+import io
+import json
+import stat
+import tarfile
+import tempfile
+import unittest
+from pathlib import Path, PurePosixPath
+
+from fakes import FakeDownloader, FakeFileSystem, FakeNpmInstaller
+
+from hpl.core import dependencies
+from hpl.core import ownership
+from hpl.core.content import Distribution, Mcp
+from hpl.infra.fs_posix import PosixFileSystem
+from hpl.ports.downloader import DownloaderError
+from real_home import _scratch_root
+
+DEPENDENCIES_DIR = Path("/home/probe/.local/share/hpl/mcp")
+AT = "2026-08-14T00:00:00+00:00"
+INTEGRITY = "sha512-" + "a" * 86 + "=="
+
+
+def make_archive(entries: dict[str, bytes], *, symlinks: dict[str, str] | None = None) -> bytes:
+    """A gzip-compressed tar built from ``entries``, for a test to fetch as bytes.
+
+    ``symlinks`` adds a symlink member, name -> target, when the escaping
+    case under test needs a link rather than a plain path.
+    """
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
+        for name, content in entries.items():
+            info = tarfile.TarInfo(name=name)
+            info.size = len(content)
+            archive.addfile(info, io.BytesIO(content))
+        for name, target in (symlinks or {}).items():
+            info = tarfile.TarInfo(name=name)
+            info.type = tarfile.SYMTYPE
+            info.linkname = target
+            archive.addfile(info)
+    return buffer.getvalue()
+
+
+def download_server(**overrides) -> Mcp:
+    content = overrides.pop("content", b"the real binary bytes")
+    fields = dict(
+        name="probe",
+        description="d",
+        body="convention",
+        distribution=Distribution.DOWNLOAD,
+        endpoint="https://example.test/releases/probe-linux-x64",
+        source=PurePosixPath("mcp/probe.md"),
+        version="1.2.3",
+        checksum=ownership.digest_of_bytes(content),
+    )
+    fields.update(overrides)
+    return Mcp(**fields), content
+
+
+class _RaisingDownloader:
+    """A downloader whose `fetch` always fails with a caller-chosen message --
+    for proving what `materialize` does with a `DownloaderError`'s own text,
+    rather than the fixed shape `FakeDownloader` raises for an unregistered
+    URL.
+
+    The message passed in is deliberately just the bare cause, never a
+    string shaped like `HttpDownloader`'s own -- `ports.downloader` makes no
+    promise that a `DownloaderError`'s text contains the URL, so a test
+    double standing in for *any* implementation of the port must not lean on
+    the one concrete adapter's formatting. If `materialize` still names the
+    URL in what it raises, that is because `materialize` added it itself
+    from `item.endpoint`, which is the only thing this test is allowed to
+    prove.
+    """
+
+    def __init__(self, message: str):
+        self._message = message
+
+    def fetch(self, url, *, timeout_seconds=None, on_progress=None):
+        raise DownloaderError(self._message)
+
+
+class TargetPathTest(unittest.TestCase):
+    def test_the_target_directory_is_named_by_id_and_version(self):
+        item, _ = download_server()
+        self.assertEqual(
+            dependencies.target_dir(DEPENDENCIES_DIR, item), DEPENDENCIES_DIR / "probe" / "1.2.3"
+        )
+
+    def test_the_binary_lands_under_the_target_directory_named_by_the_endpoint(self):
+        item, _ = download_server()
+        self.assertEqual(
+            dependencies.binary_path(DEPENDENCIES_DIR, item),
+            DEPENDENCIES_DIR / "probe" / "1.2.3" / "probe-linux-x64",
+        )
+
+
+class MaterializeTest(unittest.TestCase):
+    def setUp(self):
+        self.filesystem = FakeFileSystem()
+
+    def materialize(self, item, downloader):
+        return dependencies.materialize(self.filesystem, downloader, DEPENDENCIES_DIR, item, at=AT)
+
+    def test_a_verified_download_is_placed_at_the_binary_path(self):
+        item, content = download_server()
+        downloader = FakeDownloader({item.endpoint: content})
+        self.materialize(item, downloader)
+        target = dependencies.binary_path(DEPENDENCIES_DIR, item)
+        self.assertEqual(self.filesystem.files[target], content)
+
+    def test_the_placed_binary_is_executable(self):
+        item, content = download_server()
+        downloader = FakeDownloader({item.endpoint: content})
+        self.materialize(item, downloader)
+        target = dependencies.binary_path(DEPENDENCIES_DIR, item)
+        self.assertEqual(self.filesystem.modes[target], self.filesystem.mode_for(executable=True))
+
+    def test_the_record_identifies_what_was_fetched(self):
+        item, content = download_server()
+        downloader = FakeDownloader({item.endpoint: content})
+        record = self.materialize(item, downloader)
+        self.assertEqual(record.id, "dependency:probe")
+        self.assertEqual(record.kind, "dependency-tree")
+        self.assertEqual(record.target, dependencies.target_dir(DEPENDENCIES_DIR, item))
+        self.assertEqual(record.after_digest, item.checksum)
+
+    def test_the_record_also_names_the_program_a_cli_would_run_and_its_digest(self):
+        """A bare binary *is* the program, so its digest is read back from the
+        very bytes `write_atomic` placed -- proof this is not just repeating
+        `item.checksum` under a new name.
+        """
+        item, content = download_server()
+        downloader = FakeDownloader({item.endpoint: content})
+        record = self.materialize(item, downloader)
+        self.assertEqual(record.program_relpath, "probe-linux-x64")
+        self.assertEqual(record.program_digest, ownership.digest_of_bytes(content))
+
+    def test_a_checksum_mismatch_is_refused_naming_expected_and_arrived(self):
+        item, _ = download_server()
+        wrong = b"not the bytes anyone pinned"
+        downloader = FakeDownloader({item.endpoint: wrong})
+        with self.assertRaises(dependencies.MaterializeError) as raised:
+            self.materialize(item, downloader)
+        message = str(raised.exception)
+        self.assertIn(item.checksum, message)
+        self.assertIn(ownership.digest_of_bytes(wrong), message)
+
+    def test_a_checksum_mismatch_leaves_nothing_on_disk(self):
+        item, _ = download_server()
+        downloader = FakeDownloader({item.endpoint: b"not the bytes anyone pinned"})
+        with self.assertRaises(dependencies.MaterializeError):
+            self.materialize(item, downloader)
+        self.assertEqual(self.filesystem.files, {})
+        self.assertEqual(self.filesystem.writes, [])
+
+    def test_a_fetch_failure_names_the_server_and_the_url(self):
+        item, _ = download_server()
+        downloader = FakeDownloader({})  # nothing registered for item.endpoint
+        with self.assertRaises(dependencies.MaterializeError) as raised:
+            self.materialize(item, downloader)
+        self.assertIn(item.name, str(raised.exception))
+        self.assertIn(item.endpoint, str(raised.exception))
+
+    def test_a_fetch_failure_puts_the_reason_in_the_first_eighty_characters(self):
+        """The incident this guards against: a menu screen only 80 columns
+        wide showed `could not fetch <a long GitHub release URL>` and cut off
+        before the one word (`error`) that actually said what went wrong. The
+        endpoint here is exactly that shape -- long enough that, if the URL
+        were still placed before the reason the way it used to be, the
+        reason would fall past column 80 and never reach the screen at all.
+
+        The double raises *only* the cause, with no URL anywhere in its
+        text -- unlike `HttpDownloader`, which happens to fold the URL in
+        too. Proving the URL still shows up below, and that the reason still
+        leads, with a double this bare is what shows the ordering and the
+        URL are `materialize`'s own doing, not something it is borrowing
+        from whatever text a particular adapter's exception happens to
+        contain.
+        """
+        long_endpoint = (
+            "https://github.com/DeusData/codebase-memory-mcp/releases/download/v0.10.8/cbm-linux-x64"
+        )
+        item, _ = download_server(endpoint=long_endpoint)
+        reason = "HTTP Error 404: Not Found"
+        downloader = _RaisingDownloader(reason)
+        with self.assertRaises(dependencies.MaterializeError) as raised:
+            self.materialize(item, downloader)
+        message = str(raised.exception)
+        self.assertIn(reason, message[:80])
+        self.assertIn(long_endpoint, message)
+
+    def test_a_remote_server_is_refused_rather_than_fetched(self):
+        item, content = download_server(distribution=Distribution.REMOTE, version=None, checksum=None)
+        with self.assertRaises(dependencies.MaterializeError):
+            self.materialize(item, FakeDownloader({item.endpoint: content}))
+
+
+class MaterializeProgressTest(unittest.TestCase):
+    """`materialize`'s own `on_progress` is nothing but a pass-through to
+    `downloader.fetch` -- proving that pass-through is this module's whole
+    job here, since the byte-counting itself is `HttpDownloader`'s.
+    """
+
+    def setUp(self):
+        self.filesystem = FakeFileSystem()
+
+    def test_omitting_on_progress_changes_nothing(self):
+        item, content = download_server()
+        downloader = FakeDownloader({item.endpoint: content})
+        dependencies.materialize(self.filesystem, downloader, DEPENDENCIES_DIR, item, at=AT)
+        target = dependencies.binary_path(DEPENDENCIES_DIR, item)
+        self.assertEqual(self.filesystem.files[target], content)
+
+    def test_on_progress_is_forwarded_to_the_downloader(self):
+        item, content = download_server()
+        downloader = FakeDownloader({item.endpoint: content}, chunk_reports=[(4, 10), (10, 10)])
+        observed: list[tuple[int, int | None]] = []
+        dependencies.materialize(
+            self.filesystem, downloader, DEPENDENCIES_DIR, item, at=AT,
+            on_progress=lambda done, total: observed.append((done, total)),
+        )
+        self.assertEqual(observed, [(4, 10), (10, 10)])
+
+
+def archive_server(**overrides) -> tuple[Mcp, bytes]:
+    entries = overrides.pop("entries", {"probe": b"the real program bytes", "README.md": b"read me"})
+    archive = make_archive(entries, symlinks=overrides.pop("symlinks", None))
+    fields = dict(
+        name="probe",
+        description="d",
+        body="convention",
+        distribution=Distribution.DOWNLOAD,
+        endpoint="https://example.test/releases/probe-linux-x64.tar.gz",
+        source=PurePosixPath("mcp/probe.md"),
+        version="1.2.3",
+        checksum=ownership.digest_of_bytes(archive),
+        archive_members=tuple(entries) if "archive_members" not in overrides else overrides.pop("archive_members"),
+        archive_executable="probe",
+    )
+    fields.update(overrides)
+    return Mcp(**fields), archive
+
+
+class MaterializeArchiveTest(unittest.TestCase):
+    def setUp(self):
+        self.filesystem = FakeFileSystem()
+
+    def materialize(self, item, downloader):
+        return dependencies.materialize(self.filesystem, downloader, DEPENDENCIES_DIR, item, at=AT)
+
+    def test_every_declared_member_is_placed_under_the_target_directory(self):
+        item, archive = archive_server()
+        downloader = FakeDownloader({item.endpoint: archive})
+        self.materialize(item, downloader)
+        target = dependencies.target_dir(DEPENDENCIES_DIR, item)
+        self.assertEqual(self.filesystem.files[target / "probe"], b"the real program bytes")
+        self.assertEqual(self.filesystem.files[target / "README.md"], b"read me")
+
+    def test_only_the_declared_executable_member_is_executable(self):
+        item, archive = archive_server()
+        downloader = FakeDownloader({item.endpoint: archive})
+        self.materialize(item, downloader)
+        target = dependencies.target_dir(DEPENDENCIES_DIR, item)
+        self.assertEqual(self.filesystem.modes[target / "probe"], self.filesystem.mode_for(executable=True))
+        self.assertEqual(
+            self.filesystem.modes[target / "README.md"], self.filesystem.mode_for(executable=False)
+        )
+
+    def test_the_record_still_identifies_the_whole_tree_by_the_archives_own_digest(self):
+        item, archive = archive_server()
+        record = self.materialize(item, FakeDownloader({item.endpoint: archive}))
+        self.assertEqual(record.id, "dependency:probe")
+        self.assertEqual(record.kind, "dependency-tree")
+        self.assertEqual(record.target, dependencies.target_dir(DEPENDENCIES_DIR, item))
+        self.assertEqual(record.after_digest, item.checksum)
+
+    def test_the_record_names_the_declared_executable_member_not_the_archive(self):
+        """The archive's own digest (`after_digest`) identifies the whole
+        tarball; the program a CLI's configuration actually runs is one
+        member inside it, whose bytes hash to something else entirely --
+        proof the two are never conflated.
+        """
+        item, archive = archive_server()
+        record = self.materialize(item, FakeDownloader({item.endpoint: archive}))
+        self.assertEqual(record.program_relpath, "probe")
+        self.assertEqual(record.program_digest, ownership.digest_of_bytes(b"the real program bytes"))
+        self.assertNotEqual(record.program_digest, record.after_digest)
+
+    def test_a_checksum_mismatch_is_refused_before_the_archive_is_ever_opened(self):
+        item, _ = archive_server()
+        downloader = FakeDownloader({item.endpoint: b"not the archive anyone pinned"})
+        with self.assertRaises(dependencies.MaterializeError):
+            self.materialize(item, downloader)
+        self.assertEqual(self.filesystem.files, {})
+
+    def test_a_declared_member_missing_from_the_archive_is_refused_naming_it(self):
+        item, archive = archive_server(archive_members=("probe", "README.md", "ghost"))
+        with self.assertRaises(dependencies.MaterializeError) as raised:
+            self.materialize(item, FakeDownloader({item.endpoint: archive}))
+        self.assertIn("ghost", str(raised.exception))
+        self.assertEqual(self.filesystem.files, {})
+
+    def test_a_member_whose_symlink_escapes_the_target_directory_is_refused(self):
+        """The archive's checksum matches -- these are the exact bytes that
+        were pinned -- but one member is a symlink pointing outside the
+        directory it would be extracted into. Verifying the digest proves the
+        bytes are the ones that were pinned; it says nothing about whether a
+        member inside them is safe to place on disk, which is what this
+        proves is checked separately.
+        """
+        item, archive = archive_server(
+            entries={"README.md": b"read me"},
+            symlinks={"probe": "../../../../etc/passwd"},
+            archive_members=("probe", "README.md"),
+        )
+        with self.assertRaises(dependencies.MaterializeError) as raised:
+            self.materialize(item, FakeDownloader({item.endpoint: archive}))
+        self.assertIn("probe", str(raised.exception))
+        self.assertEqual(self.filesystem.files, {})
+        self.assertEqual(self.filesystem.writes, [])
+
+    def test_a_write_failure_partway_through_leaves_nothing_behind(self):
+        item, archive = archive_server()
+        target = dependencies.target_dir(DEPENDENCIES_DIR, item)
+        self.filesystem.fail_always.add(target / "README.md")
+        with self.assertRaises(dependencies.MaterializeError):
+            self.materialize(item, FakeDownloader({item.endpoint: archive}))
+        self.assertEqual(self.filesystem.files, {})
+        self.assertFalse(
+            any(target in candidate.parents or candidate == target for candidate in self.filesystem.directories)
+        )
+
+
+#: A real lockfile pins more than the top package alone -- ``probe-core`` here
+#: stands in for the driver a synthesized, single-package lockfile could never
+#: have named, which is exactly the gap `materialize_npm` must not reintroduce.
+NPM_LOCKFILE = (
+    b'{"name": "hpl-probe", "lockfileVersion": 3, "requires": true, "packages": {'
+    b'"": {"name": "hpl-probe", "dependencies": {"probe-mcp": "1.2.3"}}, '
+    b'"node_modules/probe-mcp": {"version": "1.2.3", '
+    b'"resolved": "https://registry.npmjs.org/probe-mcp/-/probe-mcp-1.2.3.tgz", '
+    b'"integrity": "' + INTEGRITY.encode("ascii") + b'", '
+    b'"dependencies": {"probe-core": "9.9.9"}}, '
+    b'"node_modules/probe-core": {"version": "9.9.9", '
+    b'"resolved": "https://registry.npmjs.org/probe-core/-/probe-core-9.9.9.tgz", '
+    b'"integrity": "sha512-' + (b"c" * 86) + b'=="}}}'
+)
+
+
+def npm_server(**overrides) -> Mcp:
+    fields = dict(
+        name="probe",
+        description="d",
+        body="convention",
+        distribution=Distribution.NPM,
+        endpoint="https://registry.npmjs.org/probe-mcp/-/probe-mcp-1.2.3.tgz",
+        source=PurePosixPath("mcp/probe.md"),
+        version="1.2.3",
+        package="probe-mcp",
+        integrity=INTEGRITY,
+        entry="cli.js",
+        npm_lockfile=NPM_LOCKFILE,
+        npm_package_name="hpl-probe",
+    )
+    fields.update(overrides)
+    return Mcp(**fields)
+
+
+class NpmScriptPathTest(unittest.TestCase):
+    def test_the_script_lands_under_node_modules_by_package_and_entry(self):
+        cases = {
+            "probe-mcp": "node_modules/probe-mcp/cli.js",
+            "@playwright/mcp": "node_modules/@playwright/mcp/cli.js",
+        }
+        for package, expected in cases.items():
+            with self.subTest(package=package):
+                item = npm_server(package=package)
+                self.assertEqual(
+                    dependencies.npm_script_path(DEPENDENCIES_DIR, item),
+                    DEPENDENCIES_DIR / "probe" / "1.2.3" / expected,
+                )
+
+
+class MaterializeNpmTest(unittest.TestCase):
+    def setUp(self):
+        self.filesystem = FakeFileSystem()
+
+    def materialize(self, item, installer, *, node_present=True):
+        return dependencies.materialize_npm(
+            self.filesystem, installer, DEPENDENCIES_DIR, item, node_present=node_present, at=AT
+        )
+
+    def test_a_successful_install_runs_npm_ci_in_the_target_directory(self):
+        item = npm_server()
+        installer = FakeNpmInstaller()
+        self.materialize(item, installer)
+        target = dependencies.target_dir(DEPENDENCIES_DIR, item)
+        self.assertEqual(installer.calls, [target])
+
+    def test_the_lockfile_is_written_verbatim_from_the_descriptor(self):
+        item = npm_server()
+        installer = FakeNpmInstaller()
+        self.materialize(item, installer)
+        target = dependencies.target_dir(DEPENDENCIES_DIR, item)
+        self.assertEqual(self.filesystem.files[target / "package-lock.json"], item.npm_lockfile)
+
+    def test_the_written_lockfile_still_pins_a_package_the_descriptor_never_names(self):
+        """`probe-core` is a transitive dependency, not anything `npm_server`
+        declares as its own `package` -- proof this is the real, shipped
+        lockfile and not one synthesized from the descriptor's own fields,
+        which could only ever have named the one package it does declare.
+        """
+        item = npm_server()
+        installer = FakeNpmInstaller()
+        self.materialize(item, installer)
+        target = dependencies.target_dir(DEPENDENCIES_DIR, item)
+        lock = self.filesystem.files[target / "package-lock.json"].decode("utf-8")
+        self.assertIn("probe-core", lock)
+
+    def test_a_missing_lockfile_is_refused_before_anything_is_written(self):
+        item = npm_server(npm_lockfile=None)
+        with self.assertRaises(dependencies.MaterializeError) as raised:
+            self.materialize(item, FakeNpmInstaller())
+        self.assertIn("lockfile", str(raised.exception).lower())
+        self.assertEqual(self.filesystem.files, {})
+        self.assertEqual(self.filesystem.writes, [])
+
+    def test_a_missing_package_name_is_refused_before_anything_is_written(self):
+        item = npm_server(npm_package_name=None)
+        with self.assertRaises(dependencies.MaterializeError) as raised:
+            self.materialize(item, FakeNpmInstaller())
+        self.assertIn("lockfile", str(raised.exception).lower())
+        self.assertEqual(self.filesystem.files, {})
+        self.assertEqual(self.filesystem.writes, [])
+
+    def test_package_json_names_itself_after_the_lockfiles_own_name_not_the_descriptors_stem(self):
+        """The descriptor's file stem (``item.name``, here ``probe``) and the
+        real, npm-generated lockfile's own root name need not agree -- the
+        shipped `playwright.md` descriptor and its `playwright-mcp-root`
+        lockfile are exactly such a pair. `package.json`'s own `name` has to
+        come from the lockfile `npm ci` will check it against, not from the
+        stem, or the two would disagree on any descriptor whose file is not
+        named after its lockfile's own package.
+        """
+        item = npm_server(npm_package_name="totally-different-from-the-stem")
+        installer = FakeNpmInstaller()
+        self.materialize(item, installer)
+        target = dependencies.target_dir(DEPENDENCIES_DIR, item)
+        manifest = json.loads(self.filesystem.files[target / "package.json"])
+        self.assertEqual(manifest["name"], "totally-different-from-the-stem")
+
+    def test_the_record_identifies_what_was_installed(self):
+        item = npm_server()
+        record = self.materialize(item, FakeNpmInstaller())
+        self.assertEqual(record.id, "dependency:probe")
+        self.assertEqual(record.kind, "dependency-tree")
+        self.assertEqual(record.target, dependencies.target_dir(DEPENDENCIES_DIR, item))
+        self.assertEqual(record.after_digest, item.integrity)
+
+    def test_a_fake_installer_that_writes_nothing_leaves_the_program_unrecorded(self):
+        """`FakeNpmInstaller` never touches the filesystem -- real `npm ci`
+        would have written the entry script this reads back, so with the
+        fake there is nothing there to read. `materialize_npm` must not
+        raise over that; it is `npm ci`'s own write being absent, not this
+        module's, and the fields it cannot fill are exactly what a journal
+        written before they existed also carries.
+        """
+        item = npm_server()
+        record = self.materialize(item, FakeNpmInstaller())
+        self.assertIsNone(record.program_relpath)
+        self.assertIsNone(record.program_digest)
+
+    def test_the_record_names_the_entry_script_when_it_is_there_to_read(self):
+        """Standing in for what a real `npm ci` would have placed: the entry
+        script written directly into the fake filesystem, at exactly the path
+        `npm_script_path` names, before `materialize_npm` ever reads it back.
+        """
+        item = npm_server()
+        script = b"#!/usr/bin/env node\nconsole.log('probe');\n"
+        self.filesystem.write_atomic(dependencies.npm_script_path(DEPENDENCIES_DIR, item), script)
+        record = self.materialize(item, FakeNpmInstaller())
+        self.assertEqual(record.program_relpath, "node_modules/probe-mcp/cli.js")
+        self.assertEqual(record.program_digest, ownership.digest_of_bytes(script))
+
+    def test_a_missing_node_is_refused_before_anything_is_written(self):
+        item = npm_server()
+        with self.assertRaises(dependencies.MaterializeError) as raised:
+            self.materialize(item, FakeNpmInstaller(), node_present=False)
+        self.assertIn("node", str(raised.exception).lower())
+        self.assertEqual(self.filesystem.files, {})
+        self.assertEqual(self.filesystem.writes, [])
+
+    def test_a_failed_install_leaves_nothing_on_disk(self):
+        item = npm_server()
+        target = dependencies.target_dir(DEPENDENCIES_DIR, item)
+        installer = FakeNpmInstaller(failures={target: "registry unreachable"})
+        with self.assertRaises(dependencies.MaterializeError) as raised:
+            self.materialize(item, installer)
+        self.assertIn("registry unreachable", str(raised.exception))
+        self.assertEqual(self.filesystem.files, {})
+        self.assertFalse(
+            any(target in candidate.parents or candidate == target for candidate in self.filesystem.directories)
+        )
+
+    def test_a_remote_server_is_refused_rather_than_installed(self):
+        item = npm_server(distribution=Distribution.REMOTE, version=None, package=None, integrity=None, entry=None)
+        with self.assertRaises(dependencies.MaterializeError):
+            self.materialize(item, FakeNpmInstaller())
+
+
+class MaterializeOnRealDiskTest(unittest.TestCase):
+    """The fake proves the policy -- what gets written, verified and refused;
+    this proves the bytes and modes `write_atomic` places actually land as
+    real files. Fetching and `npm ci` stay doubled (`FakeDownloader`,
+    `FakeNpmInstaller` -- a network and a package manager are not what this
+    debt is about), only the destination filesystem is real.
+    """
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory(dir=_scratch_root())
+        self.addCleanup(self.directory.cleanup)
+        self.dependencies_dir = Path(self.directory.name) / "mcp"
+        self.filesystem = PosixFileSystem(product_id="hpl")
+
+    def test_a_downloaded_binary_lands_on_disk_with_its_executable_mode(self):
+        item, content = download_server()
+        downloader = FakeDownloader({item.endpoint: content})
+        dependencies.materialize(self.filesystem, downloader, self.dependencies_dir, item, at=AT)
+        target = dependencies.binary_path(self.dependencies_dir, item)
+        self.assertEqual(target.read_bytes(), content)
+        self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o755)
+
+    def test_archive_members_land_on_disk_each_with_their_own_declared_mode(self):
+        item, archive = archive_server()
+        downloader = FakeDownloader({item.endpoint: archive})
+        dependencies.materialize(self.filesystem, downloader, self.dependencies_dir, item, at=AT)
+        target = dependencies.target_dir(self.dependencies_dir, item)
+        self.assertEqual((target / "probe").read_bytes(), b"the real program bytes")
+        self.assertEqual(stat.S_IMODE((target / "probe").stat().st_mode), 0o755)
+        self.assertEqual((target / "README.md").read_bytes(), b"read me")
+        self.assertEqual(stat.S_IMODE((target / "README.md").stat().st_mode), 0o644)
+
+    def test_a_failed_write_partway_through_an_archive_leaves_no_tree_on_disk(self):
+        """`_clean_up` calls `remove_dir`/`list_dir` on the target -- real
+        directory-tree removal is exactly the kind of thing a dict-backed
+        fake cannot mis-model in a way this would catch, so this is the one
+        place worth proving it against a real, partially written tree."""
+        item, archive = archive_server()
+        downloader = FakeDownloader({item.endpoint: archive})
+        target = dependencies.target_dir(self.dependencies_dir, item)
+        real_write_atomic = self.filesystem.write_atomic
+
+        def failing_write(path, content, *, mode=0o644):
+            if path.name == "README.md":
+                raise dependencies.FileSystemError("disk full")
+            return real_write_atomic(path, content, mode=mode)
+
+        self.filesystem.write_atomic = failing_write
+        with self.assertRaises(dependencies.MaterializeError):
+            dependencies.materialize(self.filesystem, downloader, self.dependencies_dir, item, at=AT)
+        self.assertFalse(target.exists())
+
+    def test_an_npm_install_writes_its_lockfile_and_manifest_to_real_files(self):
+        item = npm_server()
+        installer = FakeNpmInstaller()
+        dependencies.materialize_npm(
+            self.filesystem, installer, self.dependencies_dir, item, node_present=True, at=AT
+        )
+        target = dependencies.target_dir(self.dependencies_dir, item)
+        self.assertEqual((target / "package-lock.json").read_bytes(), item.npm_lockfile)
+        self.assertEqual(json.loads((target / "package.json").read_bytes())["name"], item.npm_package_name)
+
+
+class PruneTest(unittest.TestCase):
+    """Dropping version directories nothing keeps, on a real disk."""
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory(dir=_scratch_root())
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name)
+        self.dependencies_dir = self.root / "mcp"
+        self.filesystem = PosixFileSystem(product_id="hpl")
+
+    def make(self, name: str, version: str) -> Path:
+        path = self.dependencies_dir / name / version
+        path.mkdir(parents=True)
+        (path / "bin").write_bytes(b"x")
+        return path
+
+    def prune(self, names, keep):
+        return dependencies.prune(
+            self.filesystem, self.dependencies_dir, frozenset(names), frozenset(keep)
+        )
+
+    def test_a_version_nobody_keeps_is_removed(self):
+        old = self.make("engram", "1.0.0")
+        current = self.make("engram", "1.1.0")
+        outcome = self.prune({"engram"}, {current})
+        self.assertEqual(outcome.removed, (old,))
+        self.assertFalse(old.exists())
+        self.assertTrue(current.exists())
+
+    def test_every_kept_target_survives_whichever_install_holds_it(self):
+        # One install on the new version, another still on the old one: both
+        # are in the keep-set, so neither CLI loses its binary.
+        old = self.make("engram", "1.0.0")
+        new = self.make("engram", "1.1.0")
+        stale = self.make("engram", "0.9.0")
+        outcome = self.prune({"engram"}, {old, new})
+        self.assertEqual(outcome.removed, (stale,))
+        self.assertTrue(old.exists())
+        self.assertTrue(new.exists())
+
+    def test_a_name_that_is_not_managed_is_never_touched(self):
+        foreign = self.make("someone-else", "1.0.0")
+        self.make("engram", "1.0.0")
+        outcome = self.prune({"engram"}, set())
+        self.assertTrue(foreign.exists())
+        self.assertNotIn(foreign, outcome.removed)
+
+    def test_a_symlinked_version_is_not_followed_or_removed(self):
+        outside = self.root / "outside"
+        outside.mkdir()
+        (outside / "precious").write_bytes(b"keep me")
+        (self.dependencies_dir / "engram").mkdir(parents=True)
+        link = self.dependencies_dir / "engram" / "1.0.0"
+        link.symlink_to(outside, target_is_directory=True)
+        outcome = self.prune({"engram"}, set())
+        self.assertEqual(outcome.removed, ())
+        self.assertTrue(link.is_symlink())
+        self.assertTrue((outside / "precious").exists())
+
+    def test_a_symlinked_name_directory_is_not_followed(self):
+        outside = self.root / "outside"
+        (outside / "1.0.0").mkdir(parents=True)
+        self.dependencies_dir.mkdir()
+        (self.dependencies_dir / "engram").symlink_to(outside, target_is_directory=True)
+        outcome = self.prune({"engram"}, set())
+        self.assertEqual(outcome.removed, ())
+        self.assertTrue((outside / "1.0.0").exists())
+
+    def test_a_name_that_could_escape_is_ignored(self):
+        outside = self.root / "escape" / "1.0.0"
+        outside.mkdir(parents=True)
+        self.dependencies_dir.mkdir()
+        outcome = self.prune({"../escape"}, set())
+        self.assertEqual(outcome.removed, ())
+        self.assertTrue(outside.exists())
+
+    def test_a_name_directory_left_empty_is_removed(self):
+        old = self.make("engram", "1.0.0")
+        outcome = self.prune({"engram"}, set())
+        self.assertEqual(outcome.removed, (old,))
+        self.assertFalse((self.dependencies_dir / "engram").exists())
+        self.assertTrue(self.dependencies_dir.exists())
+
+    def test_a_name_directory_with_a_kept_version_stays(self):
+        self.make("engram", "1.0.0")
+        kept = self.make("engram", "1.1.0")
+        self.prune({"engram"}, {kept})
+        self.assertTrue((self.dependencies_dir / "engram").exists())
+
+    def test_a_file_among_the_versions_is_left_alone(self):
+        self.make("engram", "1.0.0")
+        stray = self.dependencies_dir / "engram" / "notes.txt"
+        stray.write_bytes(b"hello")
+        self.prune({"engram"}, set())
+        self.assertTrue(stray.exists())
+
+    def test_a_failed_deletion_is_reported_and_the_rest_still_go(self):
+        first = self.make("engram", "1.0.0")
+        second = self.make("engram", "2.0.0")
+        real = self.filesystem.remove_dir
+
+        def flaky(path):
+            if path == first:
+                raise dependencies.FileSystemError("busy")
+            return real(path)
+
+        self.filesystem.remove_dir = flaky
+        outcome = self.prune({"engram"}, set())
+        self.assertEqual(outcome.removed, (second,))
+        self.assertEqual(outcome.failed, ("busy",))
+        self.assertTrue(first.exists())
+
+    def test_stale_versions_lists_without_deleting(self):
+        old = self.make("engram", "1.0.0")
+        candidates, failures = dependencies.stale_versions(
+            self.filesystem, self.dependencies_dir, frozenset({"engram"}), frozenset()
+        )
+        self.assertEqual(candidates, [old])
+        self.assertEqual(failures, [])
+        self.assertTrue(old.exists())
+
+    def test_an_absent_dependencies_directory_is_a_no_op(self):
+        outcome = self.prune({"engram"}, set())
+        self.assertEqual(outcome, dependencies.Pruned())

@@ -1,0 +1,24 @@
+# Local credentials and generated state
+local/
+*.local.json
+.env
+.env.*
+secrets/
+.atl/
+.cache/
+node_modules/
+*.db
+*.sqlite
+__pycache__/
+*.py[cod]
+
+# Entorno y empaquetado de Python
+.venv/
+venv/
+build/
+dist/
+*.egg-info/
+
+# Lockfiles de gestores que el proyecto no usa. Un agente que corre los tests
+# con `uv run` en vez de `python3` deja este archivo en el arbol; no es nuestro.
+uv.lock

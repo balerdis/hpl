@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hpl"
+version = "7.7.8"
+description = "Additive harness of prompts, agents, skills and commands for AI coding CLIs"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+dependencies = []
+
+[project.scripts]
+hpl = "hpl.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"hpl" = ["identity.json"]
+"hpl.content" = ["**/*"]
+"hpl.adapters" = ["**/assets/**/*"]
